@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "apis": [
+    {
+      "library": "test.dll",
+      "name": "HostAdd",
+      "arg_bytes": 8,
+      "convention": "cdecl"
+    }
+  ]
+}
+

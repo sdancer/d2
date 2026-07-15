@@ -1,0 +1,20 @@
+# Original installer payload and extracted Diablo II demo files.
+/cca256ef74bc8a6a9112c820ae6f9bf0
+/extracted/
+
+# BoxedWine/Wine oracle bundle; the direct translator does not depend on it.
+/wasm/
+
+# Generated translation artifacts and captures.
+/translator/build/
+
+# Python caches and local environments.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and operating-system files.
+.DS_Store
+*.swp
+*~
