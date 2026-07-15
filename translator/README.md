@@ -152,8 +152,10 @@ Override the replay inputs or output path with `D2_AUTO_CLICKS`, `D2_AUTO_TEXT`,
 
 The Rust host in `native-egui` replaces Node with Wasmtime, eframe/egui, and a
 native Win32 compatibility boundary. It maps the linked PE images, runs the
-cooperative translated thread contexts, presents the 800x600 GDI framebuffer,
-and forwards pointer, mouse-button, text, and keyboard input.
+cooperative translated thread contexts, keeps an 800x600 presentation surface
+(scaling the shareware game's 640x480 in-game renderer), forwards input in the
+active guest coordinate space, and sends DirectSound PCM buffers to the native
+audio device.
 
 `run-gameplay-egui.sh` forwards runner options directly:
 
@@ -210,6 +212,42 @@ Recording also creates `barbarian.jsonl.state`, a snapshot of the initial
 `Save` directory. Replay runs from a private temporary copy of that snapshot,
 so it neither depends on nor modifies the live character saves. Live gameplay
 input is ignored during replay except for closing the window.
+
+## Chrome host
+
+The browser harness runs the same linked Wasm and JavaScript Win32 boundary in
+a module Web Worker, keeps an 800x600 `OffscreenCanvas` while scaling the
+640x480 in-game renderer, forwards mouse, wheel, character, and keyboard input,
+and plays guest DirectSound PCM buffers through Web Audio.
+Game data and initial saves are fetched into a synchronous in-memory filesystem
+before execution begins; browser writes are currently session-local.
+
+Start the local server and open Chrome:
+
+```sh
+./run-gameplay-web.sh --open
+```
+
+Then click **Load game**. Loading the translated module, PE images, and runtime
+data transfers roughly 180 MB on the local connection. The optional autoplay
+checkbox selects an existing saved character when one is available, otherwise
+it follows the deterministic Barbarian character-creation path.
+
+The server defaults to `http://127.0.0.1:8080/` and accepts explicit input
+locations when the build lives elsewhere:
+
+```sh
+./run-gameplay-web.sh \
+  --port 8080 \
+  --artifact-dir build/diablo-linked-gameplay \
+  --source-dir ../extracted \
+  --host-root build/runtime-files/diablo2 \
+  --manifest build/diablo-link-compact.json
+```
+
+Chrome requires `OffscreenCanvas`; current Chromium/Chrome releases provide it.
+The included server also supplies the cross-origin isolation and Wasm MIME
+headers expected by the worker.
 
 ## SQLite lifted-code debug database
 

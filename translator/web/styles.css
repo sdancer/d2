@@ -1,0 +1,97 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  background: #090806;
+  color: #e7dfcc;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 50% -20%, #3f2717 0, transparent 44rem),
+    linear-gradient(#0e0b08, #070605);
+}
+
+main {
+  width: min(1180px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 28px 0 48px;
+}
+
+header, footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+h1 { margin: 2px 0 6px; font-family: Georgia, serif; font-size: clamp(30px, 5vw, 52px); }
+.eyebrow { margin: 0; color: #c98d4e; letter-spacing: .18em; text-transform: uppercase; font-size: 12px; }
+.lede { margin: 0; color: #a69c8a; }
+
+.controls { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; }
+.controls label { color: #bcb19f; font-size: 14px; }
+button {
+  border: 1px solid #8e6238;
+  border-radius: 4px;
+  padding: 10px 16px;
+  background: linear-gradient(#5f321d, #32190f);
+  color: #fff4da;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+button:disabled { opacity: .42; cursor: default; }
+
+.game-shell {
+  position: relative;
+  width: min(100%, 960px);
+  aspect-ratio: 4 / 3;
+  margin: 24px auto 12px;
+  border: 1px solid #6c4c2d;
+  background: #000;
+  box-shadow: 0 24px 80px #000, inset 0 0 0 2px #17100b;
+  overflow: hidden;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  image-rendering: pixelated;
+  outline: none;
+}
+canvas:focus { box-shadow: inset 0 0 0 2px #d08b47; }
+
+#curtain {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  padding: 28px;
+  text-align: center;
+  background: radial-gradient(circle, rgb(30 20 13 / .9), rgb(0 0 0 / .98));
+  transition: opacity .25s ease;
+}
+#curtain.hidden { opacity: 0; pointer-events: none; }
+#status { font-size: 22px; }
+#progress { color: #a69c8a; }
+
+footer { width: min(100%, 960px); margin: 0 auto; color: #887f70; font-size: 13px; }
+#runtime { color: #d09a60; font-variant-numeric: tabular-nums; }
+
+details { width: min(100%, 960px); margin: 18px auto 0; border-top: 1px solid #2e251c; padding-top: 12px; }
+summary { cursor: pointer; color: #aa9d88; }
+pre { max-height: 300px; overflow: auto; white-space: pre-wrap; color: #b9aa92; font-size: 12px; }
+
+@media (max-width: 780px) {
+  main { width: min(100% - 16px, 960px); padding-top: 14px; }
+  header { align-items: flex-start; flex-direction: column; }
+  .controls { justify-content: flex-start; }
+  footer { align-items: flex-start; flex-direction: column; gap: 4px; }
+}

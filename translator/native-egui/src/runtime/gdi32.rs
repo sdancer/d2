@@ -328,7 +328,15 @@ impl Runtime {
                 Some(Handle::Bitmap(bitmap)) => bitmap.clone(),
                 _ => destination,
             };
-            self.present(memory, &bitmap);
+            let visible_width = width
+                .min(bitmap.width - dx.max(0))
+                .min(source.width - sx.max(0))
+                .max(1) as usize;
+            let visible_height = height
+                .min(bitmap.height - dy.max(0))
+                .min(source.height - sy.max(0))
+                .max(1) as usize;
+            self.present(memory, &bitmap, visible_width, visible_height);
         }
         Ok(1)
     }

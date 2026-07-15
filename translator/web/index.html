@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Diablo II — translated WebAssembly</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">D2WASM browser host</p>
+          <h1>Diablo II in Chrome</h1>
+          <p class="lede">The lifted x86 guest runs in a Web Worker. Canvas input is forwarded as Win32 messages.</p>
+        </div>
+        <div class="controls">
+          <label><input id="demo" type="checkbox"> Autoplay to Rogue Encampment</label>
+          <button id="start" type="button">Load game</button>
+          <button id="pause" type="button" disabled>Pause</button>
+        </div>
+      </header>
+
+      <section class="game-shell" aria-label="Game surface">
+        <canvas id="game" width="800" height="600" tabindex="0"></canvas>
+        <div id="curtain">
+          <strong id="status">Ready to load</strong>
+          <span id="progress">About 180 MB is loaded locally before execution starts.</span>
+        </div>
+      </section>
+
+      <footer>
+        <span id="runtime">Stopped</span>
+        <span>Click the game surface before using the keyboard.</span>
+      </footer>
+
+      <details>
+        <summary>Host diagnostics</summary>
+        <pre id="log"></pre>
+      </details>
+    </main>
+    <script type="module" src="/app.mjs"></script>
+  </body>
+</html>

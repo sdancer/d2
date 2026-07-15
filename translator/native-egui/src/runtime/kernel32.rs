@@ -150,9 +150,9 @@ impl Runtime {
                 Ok(1)
             }
             "TlsGetValue" => Ok(self.tls.get(&arg(memory, sp, 0)).copied().unwrap_or(0)),
-            "GetTickCount" => Ok(self.tick(16)),
+            "GetTickCount" => Ok(self.clock_now()),
             "Sleep" => {
-                self.tick(arg(memory, sp, 0));
+                self.advance_clock(arg(memory, sp, 0));
                 Ok(0)
             }
             "WaitForSingleObject" => {
@@ -189,9 +189,8 @@ impl Runtime {
                 Ok(1)
             }
             "QueryPerformanceCounter" => {
-                let value = u64::from(self.virtual_time) * 1_000;
+                let value = u64::from(self.clock_now()) * 1_000;
                 write_u64(memory, arg(memory, sp, 0), value)?;
-                self.tick(16);
                 Ok(1)
             }
             "OutputDebugStringA" => {

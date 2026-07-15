@@ -3,8 +3,21 @@ pub enum HostEvent {
     Frame {
         width: usize,
         height: usize,
+        input_width: usize,
+        input_height: usize,
         rgba: Vec<u8>,
         presentation: u64,
+    },
+    AudioPlay {
+        id: u32,
+        channels: u16,
+        sample_rate: u32,
+        samples: Vec<f32>,
+        looping: bool,
+        volume: f32,
+    },
+    AudioStop {
+        id: u32,
     },
     Status(String),
     Log(String),

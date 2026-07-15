@@ -9,6 +9,7 @@ use std::{
     fs::File,
     path::{Component, Path, PathBuf},
     sync::mpsc::{Receiver, SyncSender, TryRecvError},
+    time::Instant,
 };
 
 const SCREEN_WIDTH: usize = 800;
@@ -91,6 +92,32 @@ struct Message {
     message: u32,
     w_param: u32,
     l_param: u32,
+}
+
+#[derive(Clone, Debug)]
+struct WaveFormat {
+    format_tag: u16,
+    channels: u16,
+    samples_per_second: u32,
+    average_bytes_per_second: u32,
+    block_align: u16,
+    bits_per_sample: u16,
+}
+
+#[derive(Debug)]
+struct SoundBuffer {
+    id: u32,
+    primary: bool,
+    flags: u32,
+    size: u32,
+    bytes: u32,
+    format: WaveFormat,
+    volume: i32,
+    pan: i32,
+    frequency: u32,
+    playing: bool,
+    play_flags: u32,
+    play_started: u32,
 }
 
 #[derive(Debug)]
@@ -192,6 +219,13 @@ pub struct Runtime {
     auto_keys: VecDeque<(u32, u64)>,
     show_cursor_count: i32,
     virtual_time: u32,
+    clock_origin: Instant,
+    clock_offset: u32,
+    presentation_width: usize,
+    presentation_height: usize,
+    direct_sound_objects: HashSet<u32>,
+    sound_buffers: HashMap<u32, SoundBuffer>,
+    next_sound_id: u32,
     unknown_apis: HashSet<String>,
     event_tx: SyncSender<HostEvent>,
     input_rx: Receiver<InputEvent>,
@@ -290,6 +324,13 @@ impl Runtime {
             auto_keys,
             show_cursor_count: 0,
             virtual_time: 0,
+            clock_origin: Instant::now(),
+            clock_offset: 0,
+            presentation_width: SCREEN_WIDTH,
+            presentation_height: SCREEN_HEIGHT,
+            direct_sound_objects: HashSet::new(),
+            sound_buffers: HashMap::new(),
+            next_sound_id: 1,
             unknown_apis: HashSet::new(),
             event_tx,
             input_rx,
@@ -383,14 +424,8 @@ impl Runtime {
             "win32.version.dll" => self.version(name, sp, memory)?,
             "win32.imm32.dll" => self.imm32(name, sp, memory)?,
             "win32.wsock32.dll" => self.wsock32(name, sp, memory)?,
-            "win32.dsound.dll" => {
-                let output = arg(memory, sp, 1);
-                if output != 0 {
-                    write_u32(memory, output, 0)?;
-                }
-                0x8878_0078
-            }
-            "win32.winmm.dll" => self.tick(16),
+            "win32.dsound.dll" => self.dsound(name, sp, memory)?,
+            "win32.winmm.dll" => self.clock_now(),
             _ => self.unknown(library, name, 0),
         };
         Ok(DispatchResult::Value(value))
@@ -406,8 +441,20 @@ impl Runtime {
         fallback
     }
 
-    fn tick(&mut self, delta: u32) -> u32 {
-        self.virtual_time = self.virtual_time.wrapping_add(delta);
+    fn clock_now(&mut self) -> u32 {
+        let elapsed = self
+            .clock_origin
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32;
+        self.virtual_time = self.clock_offset.wrapping_add(elapsed);
+        self.virtual_time
+    }
+
+    fn advance_clock(&mut self, delta: u32) -> u32 {
+        self.clock_offset = self.clock_now().wrapping_add(delta);
+        self.clock_origin = Instant::now();
+        self.virtual_time = self.clock_offset;
         self.virtual_time
     }
 
@@ -724,7 +771,7 @@ impl Runtime {
         });
     }
 
-    fn present(&mut self, memory: &[u8], bitmap: &Bitmap) {
+    fn present(&mut self, memory: &[u8], bitmap: &Bitmap, width: usize, height: usize) {
         self.screen_presentations += 1;
         self.poll_input();
         if self.quit_requested {
@@ -787,17 +834,27 @@ impl Runtime {
                 self.screen_presentations
             ));
         }
-        let width = bitmap.width.max(1) as usize;
-        let height = bitmap.height.max(1) as usize;
+        let source_width = width.max(1).min(bitmap.width.max(1) as usize);
+        let source_height = height.max(1).min(bitmap.height.max(1) as usize);
+        self.presentation_width = source_width;
+        self.presentation_height = source_height;
+        let width = SCREEN_WIDTH;
+        let height = SCREEN_HEIGHT;
         let Some(source) = memory.get(bitmap.bits as usize..bitmap.bits as usize + bitmap.size)
         else {
             return;
         };
         let mut rgba = vec![0; width * height * 4];
         for y in 0..height {
-            let source_y = if bitmap.top_down { y } else { height - 1 - y };
+            let scaled_y = y * source_height / height;
+            let source_y = if bitmap.top_down {
+                scaled_y
+            } else {
+                bitmap.height as usize - 1 - scaled_y
+            };
             for x in 0..width {
-                let input = source_y * bitmap.stride + x * 4;
+                let scaled_x = x * source_width / width;
+                let input = source_y * bitmap.stride + scaled_x * 4;
                 let output = (y * width + x) * 4;
                 rgba[output] = source[input + 2];
                 rgba[output + 1] = source[input + 1];
@@ -805,9 +862,10 @@ impl Runtime {
                 rgba[output + 3] = 0xff;
             }
         }
+        let virtual_time = self.clock_now();
         if let Err(error) = self.gameplay.checkpoint(
             self.screen_presentations,
-            self.virtual_time,
+            virtual_time,
             width,
             height,
             &rgba,
@@ -817,6 +875,8 @@ impl Runtime {
         let _ = self.event_tx.try_send(HostEvent::Frame {
             width,
             height,
+            input_width: source_width,
+            input_height: source_height,
             rgba,
             presentation: self.screen_presentations,
         });
@@ -1007,6 +1067,7 @@ fn write_i32(memory: &mut [u8], pointer: u32, value: i32) -> Result<()> {
     write_u32(memory, pointer, value as u32)
 }
 
+mod dsound;
 mod gdi32;
 mod kernel32;
 mod misc;

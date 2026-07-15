@@ -397,23 +397,43 @@ fn register_imports(module: &Module, linker: &mut Linker<HostState>) -> Result<(
             &name,
             function_type,
             move |mut caller: Caller<'_, HostState>, parameters, results| {
-                if parameters.len() != 1 || results.len() != 1 {
+                let dsound_method =
+                    callback_library == "win32.dsound.dll" && callback_name == "__dispatch";
+                let expected_parameters = if dsound_method { 2 } else { 1 };
+                if parameters.len() != expected_parameters || results.len() != 1 {
                     return Err(WasmtimeError::msg(format!(
                         "unexpected host signature for {}!{}",
                         callback_library, callback_name
                     )));
                 }
-                let sp = match parameters[0] {
+                let method = if dsound_method {
+                    match parameters[0] {
+                        Val::I32(value) => value as u32,
+                        _ => return Err(WasmtimeError::msg("DirectSound method is not i32")),
+                    }
+                } else {
+                    0
+                };
+                let sp = match parameters[expected_parameters - 1] {
                     Val::I32(value) => value as u32,
                     _ => return Err(WasmtimeError::msg("host stack pointer is not i32")),
                 };
                 let memory = exported_memory(&mut caller)?;
                 let outcome = {
                     let (bytes, state) = memory.data_and_store_mut(&mut caller);
-                    state
-                        .runtime
-                        .dispatch(&callback_library, &callback_name, sp, bytes)
-                        .map_err(|error| WasmtimeError::msg(format!("{error:#}")))?
+                    if dsound_method {
+                        DispatchResult::Value(
+                            state
+                                .runtime
+                                .dispatch_dsound_method(method, sp, bytes)
+                                .map_err(|error| WasmtimeError::msg(format!("{error:#}")))?,
+                        )
+                    } else {
+                        state
+                            .runtime
+                            .dispatch(&callback_library, &callback_name, sp, bytes)
+                            .map_err(|error| WasmtimeError::msg(format!("{error:#}")))?
+                    }
                 };
                 if callback_library == "win32.user32.dll"
                     && callback_name == "MessageBoxA"

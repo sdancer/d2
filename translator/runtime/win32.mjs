@@ -1,5 +1,4 @@
-import fs from "node:fs";
-import path from "node:path";
+import { hostFs as fs, hostPath as path, isNodeHost } from "./host-platform.mjs";
 
 const PAGE_SIZE = 64 * 1024;
 
@@ -8,7 +7,8 @@ export class Win32Runtime {
     this.memory = null;
     this.lastError = 0;
     this.exitCode = null;
-    this.stdout = options.stdout ?? ((text) => process.stdout.write(text));
+    this.stdout = options.stdout ?? ((text) => isNodeHost ? process.stdout.write(text) : console.log(text));
+    this.environment = options.environment ?? (isNodeHost ? process.env : {});
     this.commandLine = options.commandLine ?? '"C:\\Diablo II\\Diablo II.exe" -w';
     this.moduleFilename = options.moduleFilename ?? "C:\\Diablo II\\Diablo II.exe";
     this.heapCursor = options.heapBase ?? 0x00800000;
@@ -22,6 +22,9 @@ export class Win32Runtime {
     this.mainModuleHandle = 0x00400000;
     this.nextModuleHandle = 0x10000;
     this.virtualTime = options.virtualTime ?? 0;
+    this.clock = options.clock ?? (() => performance.now());
+    this.clockOrigin = this.clock();
+    this.clockOffset = this.virtualTime;
     this.epochMilliseconds = options.epochMilliseconds ?? Date.UTC(2000, 0, 1);
     this.showCursorCount = 0;
     this.currentDirectory = options.currentDirectory ?? "C:\\Diablo II";
@@ -37,10 +40,14 @@ export class Win32Runtime {
     this.recentApis = [];
     this.screenBitmapHandle = 0;
     this.screenPresentations = 0;
+    this.presentationWidth = 800;
+    this.presentationHeight = 600;
     this.windowClasses = new Map();
     this.nextWindowAtom = 1;
     this.activeWindow = 0;
     this.messageQueue = [];
+    this.onPresent = options.onPresent ?? null;
+    this.onAudio = options.onAudio ?? null;
     this.cursorX = 0;
     this.cursorY = 0;
     this.autoClickIndex = 0;
@@ -56,6 +63,11 @@ export class Win32Runtime {
     this.virtualDirectories = new Set();
     this.clipboard = new Map();
     this.events = [];
+    this.directSoundObjects = new Set();
+    this.soundBuffers = new Map();
+    this.nextSoundId = 1;
+    this.directSoundCreatedReported = false;
+    this.directSoundPlaybackReported = false;
   }
 
   attach(memory, exports = null) {
@@ -176,9 +188,182 @@ export class Win32Runtime {
     return count;
   }
 
-  advanceClock(milliseconds = 16) {
-    this.virtualTime = (this.virtualTime + (milliseconds >>> 0)) >>> 0;
+  clockNow() {
+    const elapsed = Math.max(0, Math.trunc(this.clock() - this.clockOrigin));
+    this.virtualTime = (this.clockOffset + elapsed) >>> 0;
     return this.virtualTime;
+  }
+
+  advanceClock(milliseconds = 0) {
+    this.clockOffset = (this.clockNow() + (milliseconds >>> 0)) >>> 0;
+    this.clockOrigin = this.clock();
+    this.virtualTime = this.clockOffset;
+    return this.virtualTime;
+  }
+
+  createComObject(methodBase, methodCount) {
+    const vtable = this.alloc(methodCount * 4, 4);
+    for (let method = 0; method < methodCount; method++) {
+      this.view().setUint32(vtable + method * 4, (0xfffe0000 + (methodBase + method) * 4) >>> 0, true);
+    }
+    const object = this.alloc(4, 4);
+    this.view().setUint32(object, vtable, true);
+    return object;
+  }
+
+  readWaveFormat(pointer) {
+    if (!pointer) return { formatTag: 1, channels: 2, samplesPerSec: 22050, avgBytesPerSec: 88200, blockAlign: 4, bitsPerSample: 16 };
+    const view = this.view();
+    return {
+      formatTag: view.getUint16(pointer, true),
+      channels: view.getUint16(pointer + 2, true),
+      samplesPerSec: view.getUint32(pointer + 4, true),
+      avgBytesPerSec: view.getUint32(pointer + 8, true),
+      blockAlign: view.getUint16(pointer + 12, true),
+      bitsPerSample: view.getUint16(pointer + 14, true),
+    };
+  }
+
+  writeWaveFormat(pointer, format) {
+    const view = this.view();
+    view.setUint16(pointer, format.formatTag, true);
+    view.setUint16(pointer + 2, format.channels, true);
+    view.setUint32(pointer + 4, format.samplesPerSec, true);
+    view.setUint32(pointer + 8, format.avgBytesPerSec, true);
+    view.setUint16(pointer + 12, format.blockAlign, true);
+    view.setUint16(pointer + 14, format.bitsPerSample, true);
+    view.setUint16(pointer + 16, 0, true);
+  }
+
+  emitSound(buffer) {
+    if (!this.onAudio || buffer.primary || !buffer.bytes) return;
+    const bytes = new Uint8Array(this.memory.buffer, buffer.bytes, buffer.size).slice();
+    this.onAudio({
+      type: "play",
+      id: buffer.id,
+      bytes,
+      format: buffer.format,
+      loop: Boolean(buffer.playFlags & 1),
+      volume: buffer.volume,
+      pan: buffer.pan,
+      frequency: buffer.frequency || buffer.format.samplesPerSec,
+    });
+    if (!this.directSoundPlaybackReported) {
+      this.directSoundPlaybackReported = true;
+      this.events.push({ type: "direct-sound-playback" });
+    }
+  }
+
+  dispatchDirectSound(method, sp) {
+    const view = this.view();
+    const object = this.arg(sp, 0);
+    if (method <= 2 || (method >= 32 && method <= 34)) {
+      const relative = method >= 32 ? method - 32 : method;
+      if (relative === 0) {
+        const output = this.arg(sp, 2);
+        if (output) view.setUint32(output, object, true);
+        return 0;
+      }
+      return relative === 1 ? 2 : 1;
+    }
+    if (method < 32) {
+      if (!this.directSoundObjects.has(object)) return 0x88780032;
+      if (method === 3) {
+        const descriptor = this.arg(sp, 1), output = this.arg(sp, 2);
+        if (!descriptor || !output) return 0x80070057;
+        const flags = view.getUint32(descriptor + 4, true);
+        const primary = Boolean(flags & 1);
+        const size = primary ? 0 : view.getUint32(descriptor + 8, true);
+        const formatPointer = view.getUint32(descriptor + 16, true);
+        const format = this.readWaveFormat(formatPointer);
+        const bufferObject = this.createComObject(32, 21);
+        const buffer = {
+          id: this.nextSoundId++, object: bufferObject, primary, flags, size,
+          bytes: primary || !size ? 0 : this.alloc(size, 16), format,
+          volume: 0, pan: 0, frequency: format.samplesPerSec,
+          playing: false, playFlags: 0, playStarted: 0,
+        };
+        this.soundBuffers.set(bufferObject, buffer);
+        this.view().setUint32(output, bufferObject, true);
+        return 0;
+      }
+      if (method === 4) {
+        const output = this.arg(sp, 1);
+        if (output) {
+          const size = view.getUint32(output, true);
+          new Uint8Array(this.memory.buffer, output + 4, Math.max(0, Math.min(size, 96) - 4)).fill(0);
+          if (size >= 8) view.setUint32(output + 4, 0x3f, true);
+        }
+        return 0;
+      }
+      if (method === 8) {
+        const output = this.arg(sp, 1);
+        if (output) view.setUint32(output, 4, true);
+        return 0;
+      }
+      return 0;
+    }
+    const buffer = this.soundBuffers.get(object);
+    if (!buffer) return 0x88780032;
+    const relative = method - 32;
+    if (relative === 3) {
+      const output = this.arg(sp, 1);
+      if (output) {
+        const size = view.getUint32(output, true);
+        new Uint8Array(this.memory.buffer, output + 4, Math.max(0, Math.min(size, 32) - 4)).fill(0);
+        if (size >= 8) view.setUint32(output + 4, buffer.flags, true);
+        if (size >= 12) view.setUint32(output + 8, buffer.size, true);
+      }
+    } else if (relative === 4) {
+      const elapsed = buffer.playing ? Math.max(0, this.clockNow() - buffer.playStarted) : 0;
+      const cursor = buffer.size && buffer.format.avgBytesPerSec
+        ? Math.floor(elapsed * buffer.format.avgBytesPerSec / 1000) % buffer.size : 0;
+      const play = this.arg(sp, 1), write = this.arg(sp, 2);
+      if (play) view.setUint32(play, cursor, true);
+      if (write) view.setUint32(write, buffer.size ? (cursor + buffer.format.blockAlign * 4) % buffer.size : 0, true);
+    } else if (relative === 5) {
+      const output = this.arg(sp, 1), size = this.arg(sp, 2), written = this.arg(sp, 3);
+      if (output && size) this.writeWaveFormat(output, buffer.format);
+      if (written) view.setUint32(written, 18, true);
+    } else if (relative === 6) {
+      const output = this.arg(sp, 1); if (output) view.setInt32(output, buffer.volume, true);
+    } else if (relative === 7) {
+      const output = this.arg(sp, 1); if (output) view.setInt32(output, buffer.pan, true);
+    } else if (relative === 8) {
+      const output = this.arg(sp, 1); if (output) view.setUint32(output, buffer.frequency, true);
+    } else if (relative === 9) {
+      const output = this.arg(sp, 1); if (output) view.setUint32(output, buffer.playing ? 1 | (buffer.playFlags & 1 ? 4 : 0) : 0, true);
+    } else if (relative === 11) {
+      if (!buffer.bytes || !buffer.size) return 0x88780032;
+      let offset = this.arg(sp, 1) % buffer.size;
+      let count = this.arg(sp, 2);
+      if ((this.arg(sp, 7) & 2) || !count) count = buffer.size;
+      count = Math.min(count, buffer.size);
+      const first = Math.min(count, buffer.size - offset), second = count - first;
+      view.setUint32(this.arg(sp, 3), buffer.bytes + offset, true);
+      view.setUint32(this.arg(sp, 4), first, true);
+      if (this.arg(sp, 5)) view.setUint32(this.arg(sp, 5), second ? buffer.bytes : 0, true);
+      if (this.arg(sp, 6)) view.setUint32(this.arg(sp, 6), second, true);
+    } else if (relative === 12) {
+      buffer.playFlags = this.arg(sp, 3);
+      buffer.playing = true;
+      buffer.playStarted = this.clockNow();
+      this.emitSound(buffer);
+    } else if (relative === 13) {
+      buffer.playStarted = this.clockNow() - Math.floor(this.arg(sp, 1) * 1000 / Math.max(1, buffer.format.avgBytesPerSec));
+    } else if (relative === 14) {
+      buffer.format = this.readWaveFormat(this.arg(sp, 1));
+    } else if (relative === 15) {
+      buffer.volume = this.arg(sp, 1) | 0;
+    } else if (relative === 16) {
+      buffer.pan = this.arg(sp, 1) | 0;
+    } else if (relative === 17) {
+      buffer.frequency = this.arg(sp, 1);
+    } else if (relative === 18) {
+      buffer.playing = false;
+      this.onAudio?.({ type: "stop", id: buffer.id });
+    }
+    return 0;
   }
 
   formatAnsi(formatPointer, argumentsPointer) {
@@ -257,13 +442,29 @@ export class Win32Runtime {
     this.messageQueue.push({ hwnd: hwnd >>> 0, message: message >>> 0, wParam: wParam >>> 0, lParam: lParam >>> 0 });
   }
 
+  enqueuePointer(message, x, y, wParam = 0) {
+    this.cursorX = Math.max(0, Math.min(this.presentationWidth - 1, Math.trunc(x)));
+    this.cursorY = Math.max(0, Math.min(this.presentationHeight - 1, Math.trunc(y)));
+    const lParam = ((this.cursorY & 0xffff) << 16 | this.cursorX & 0xffff) >>> 0;
+    this.enqueueMessage(this.activeWindow, 0x0200, 0, lParam);
+    if (message !== 0x0200) this.enqueueMessage(this.activeWindow, message, wParam, lParam);
+  }
+
+  enqueueKey(virtualKey, down) {
+    this.enqueueMessage(this.activeWindow, down ? 0x0100 : 0x0101, virtualKey, 1);
+  }
+
+  enqueueCharacter(codePoint) {
+    this.enqueueMessage(this.activeWindow, 0x0102, codePoint, 1);
+  }
+
   writeMessage(pointer, message) {
     const view = this.view();
     view.setUint32(pointer, message.hwnd, true);
     view.setUint32(pointer + 4, message.message, true);
     view.setUint32(pointer + 8, message.wParam, true);
     view.setUint32(pointer + 12, message.lParam, true);
-    view.setUint32(pointer + 16, this.virtualTime, true);
+    view.setUint32(pointer + 16, this.clockNow(), true);
     view.setInt32(pointer + 20, this.cursorX, true);
     view.setInt32(pointer + 24, this.cursorY, true);
   }
@@ -456,7 +657,7 @@ export class Win32Runtime {
       TlsFree: (sp) => { this.tls.delete(this.arg(sp, 0)); return 1; },
       TlsSetValue: (sp) => { this.tls.set(this.arg(sp, 0), this.arg(sp, 1)); return 1; },
       TlsGetValue: (sp) => this.tls.get(this.arg(sp, 0)) ?? 0,
-      GetTickCount: () => this.advanceClock(),
+      GetTickCount: () => this.clockNow(),
       Sleep: (sp) => { this.advanceClock(this.arg(sp, 0)); return 0; },
       WaitForSingleObject: (sp) => this.waitForSingleObject(this.arg(sp, 0), this.arg(sp, 1)),
       WaitForMultipleObjects: () => 0,
@@ -490,14 +691,14 @@ export class Win32Runtime {
       GetProcessHeap: () => 1,
       SetErrorMode: (sp) => { const previous = this.errorMode; this.errorMode = this.arg(sp, 0); return previous; },
       QueryPerformanceFrequency: (sp) => { this.view().setBigUint64(this.arg(sp, 0), 1000000n, true); return 1; },
-      QueryPerformanceCounter: (sp) => { this.view().setBigUint64(this.arg(sp, 0), BigInt(this.virtualTime) * 1000n, true); this.advanceClock(); return 1; },
+      QueryPerformanceCounter: (sp) => { this.view().setBigUint64(this.arg(sp, 0), BigInt(this.clockNow()) * 1000n, true); return 1; },
       OutputDebugStringA: (sp) => {
         this.events.push({ type: "debug", text: this.readCString(this.arg(sp, 0)), trace: this.captureTrace(32) });
         if (this.events.length > 256) this.events.shift();
         return 0;
       },
       GetLocalTime: (sp) => {
-        const date = new Date(this.epochMilliseconds + this.virtualTime), pointer = this.arg(sp, 0), view = this.view();
+        const date = new Date(this.epochMilliseconds + this.clockNow()), pointer = this.arg(sp, 0), view = this.view();
         const values = [date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDay(), date.getUTCDate(), date.getUTCHours(), date.getUTCMinutes(), date.getUTCSeconds(), date.getUTCMilliseconds()];
         for (let index = 0; index < values.length; index++) view.setUint16(pointer + index * 2, values[index], true);
         return 0;
@@ -571,7 +772,7 @@ export class Win32Runtime {
       SetHandleCount: (sp) => this.arg(sp, 0),
       GetEnvironmentVariableA: (sp) => {
         const name = this.readCString(this.arg(sp, 0));
-        const value = process.env[name];
+        const value = this.environment[name];
         if (value === undefined) { this.lastError = 203; return 0; }
         const capacity = this.arg(sp, 2), required = new TextEncoder().encode(value).length;
         if (capacity <= required) return required + 1;
@@ -580,7 +781,7 @@ export class Win32Runtime {
       },
       SetEnvironmentVariableA: (sp) => {
         const name = this.readCString(this.arg(sp, 0)), valuePointer = this.arg(sp, 1);
-        if (valuePointer) process.env[name] = this.readCString(valuePointer); else delete process.env[name];
+        if (valuePointer) this.environment[name] = this.readCString(valuePointer); else delete this.environment[name];
         return 1;
       },
       GetSystemDefaultLangID: () => 0x0409,
@@ -943,8 +1144,8 @@ export class Win32Runtime {
     return {
       MessageBoxA: (sp) => {
         const event = { type: "message-box", text: this.readCString(this.arg(sp, 1)), caption: this.readCString(this.arg(sp, 2)), trace: this.captureTrace(128), stackCodePointers: this.captureCodePointers(sp) };
-        if (process.env.D2_WATCH_WORDS) {
-          event.memoryWords = Object.fromEntries(process.env.D2_WATCH_WORDS.split(",").map((text) => {
+        if (this.environment.D2_WATCH_WORDS) {
+          event.memoryWords = Object.fromEntries(this.environment.D2_WATCH_WORDS.split(",").map((text) => {
             const address = Number.parseInt(text.trim(), 0) >>> 0;
             return [`0x${address.toString(16).padStart(8, "0")}`, this.view().getUint32(address, true)];
           }));
@@ -1447,13 +1648,15 @@ export class Win32Runtime {
         }
         if (destination.screen) {
           this.screenPresentations++;
+          this.presentationWidth = Math.max(1, Math.min(destination.width - Math.max(dx, 0), source.width - Math.max(sx, 0), width));
+          this.presentationHeight = Math.max(1, Math.min(destination.height - Math.max(dy, 0), source.height - Math.max(sy, 0), height));
           if (this.delayedWatchPc !== undefined
               && this.screenPresentations >= this.delayedWatchPresentation) {
             this.exports?.d2_set_watch_pc?.(this.delayedWatchPc);
             this.delayedWatchPc = undefined;
           }
         }
-        const clickSchedule = process.env.D2_AUTO_CLICKS ?? process.env.D2_AUTO_CLICK;
+        const clickSchedule = this.environment.D2_AUTO_CLICKS ?? this.environment.D2_AUTO_CLICK;
         if (destination.screen && clickSchedule) {
           const clicks = clickSchedule.split(";").filter(Boolean);
           if (this.autoClickIndex < clicks.length) {
@@ -1470,10 +1673,10 @@ export class Win32Runtime {
             }
           }
         }
-        if (destination.screen && !this.autoTextQueued && process.env.D2_AUTO_TEXT) {
-          const separator = process.env.D2_AUTO_TEXT.lastIndexOf(",");
-          const text = separator < 0 ? process.env.D2_AUTO_TEXT : process.env.D2_AUTO_TEXT.slice(0, separator);
-          const presentation = Number(separator < 0 ? 600 : process.env.D2_AUTO_TEXT.slice(separator + 1));
+        if (destination.screen && !this.autoTextQueued && this.environment.D2_AUTO_TEXT) {
+          const separator = this.environment.D2_AUTO_TEXT.lastIndexOf(",");
+          const text = separator < 0 ? this.environment.D2_AUTO_TEXT : this.environment.D2_AUTO_TEXT.slice(0, separator);
+          const presentation = Number(separator < 0 ? 600 : this.environment.D2_AUTO_TEXT.slice(separator + 1));
           if (this.screenPresentations >= presentation) {
             for (const character of text) {
               const code = character.codePointAt(0);
@@ -1484,6 +1687,12 @@ export class Win32Runtime {
             this.autoTextQueued = true;
           }
         }
+        if (destination.screen && this.onPresent) {
+          this.onPresent(destination, this.screenPresentations, {
+            width: this.presentationWidth,
+            height: this.presentationHeight,
+          });
+        }
         return 1;
       },
       GdiFlush: () => 1,
@@ -1492,7 +1701,7 @@ export class Win32Runtime {
   }
 
   winmm() {
-    return { timeGetTime: () => this.advanceClock() };
+    return { timeGetTime: () => this.clockNow() };
   }
 
   imm32() {
@@ -1578,9 +1787,17 @@ export class Win32Runtime {
     return {
       "#1": (sp) => {
         const output = this.arg(sp, 1);
-        if (output) this.view().setUint32(output, 0, true);
-        return 0x88780078;
+        if (!output) return 0x80070057;
+        const object = this.createComObject(0, 11);
+        this.directSoundObjects.add(object);
+        this.view().setUint32(output, object, true);
+        if (!this.directSoundCreatedReported) {
+          this.directSoundCreatedReported = true;
+          this.events.push({ type: "direct-sound-created", object });
+        }
+        return 0;
       },
+      "__dispatch": (method, sp) => this.dispatchDirectSound(method >>> 0, sp >>> 0),
     };
   }
 
