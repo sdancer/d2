@@ -4,30 +4,103 @@ This directory is the direct-translation path for the Diablo II demo.  It does
 not execute an x86 decoder or instruction interpreter at runtime.  The build
 harness decodes PE32/i386 files ahead of time, forms basic blocks, emits C for
 those already-decoded blocks, and lets Clang lower that code to WebAssembly.
-The existing BoxedWine bundle in `../wasm` is retained only as a behavioral
-oracle.
+A BoxedWine bundle may be retained locally in `../wasm` as a behavioral oracle;
+it is not required by the translator or committed to this repository.
 
 The generated module uses one dispatch per translated **basic block** so that
 irreducible and indirect PE control flow can be admitted incrementally.  x86
 instructions themselves become Wasm arithmetic, loads, stores, and branches;
 there is no runtime fetch/decode/execute loop.
 
-## Commands
+## Quick start with the verified checkout
+
+If `../extracted` and `build/diablo-linked-gameplay` are already present, run
+the deterministic title-menu-to-gameplay replay directly:
 
 ```sh
-# Inventory the real module set and write a machine-readable coverage report.
-./d2wasm.py inventory ../extracted --filename-map filename-map.json \
-  --output build/inventory.json
-
-# Lift a PE entry point, compile it, and emit translation diagnostics.
-./d2wasm.py translate some-i386.exe --output-dir build/some-i386
-
-# Run the hermetic PE -> Wasm behavioral smoke test (expects clang/lld-link/node).
-./tests/smoke.sh
+./run-gameplay-demo.sh
 ```
 
-To build the full linked gameplay artifact (the partial exit status is expected
-while untranslated, unreachable diagnostic sites remain in the report):
+The runner writes the final 800x600 software framebuffer to
+`build/diablo-gameplay.ppm`. It is a Node.js host today; it does not invoke
+Wine or BoxedWine, and it is not yet packaged as a Chrome application.
+
+## Clean build from the shareware demo
+
+### Requirements
+
+- Python 3.10 or newer and the packages in `requirements.txt`
+- Node.js 20 or newer
+- Clang with the `wasm32-unknown-unknown` target and `wasm-ld`
+- `lld-link` for the hermetic smoke tests
+
+One setup option is:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+### 1. Supply the demo objects
+
+The original Diablo II shareware/demo installer was publicly distributed and
+is readily available from software archives. It is intentionally not copied
+into this repository. Extract its embedded objects into an `extracted`
+directory next to `translator`:
+
+```text
+d2/
+├── extracted/
+│   ├── File00000023.mpq
+│   ├── File00000025.mpq
+│   ├── File00000137.exe
+│   └── ...
+└── translator/
+```
+
+The verified installer object is 138,309,685 bytes with SHA-256
+`89352716523e474514553e2092a1ae9349c5c7ff9e79c7861dd65fe19be88b61`.
+The translator repository contains no Blizzard executable or archive data.
+
+### 2. Prepare the runtime filesystem
+
+Map the anonymous installer object names to the names expected under
+`C:\Diablo II`. The preparation script reads `filename-map.json`, adds the six
+known MPQ mappings, verifies every input before writing, and accepts
+already-named files as well:
+
+```sh
+./prepare-runtime-files.py
+```
+
+Its defaults are equivalent to:
+
+```sh
+./prepare-runtime-files.py \
+  --source-dir ../extracted \
+  --output-dir build/runtime-files/diablo2 \
+  --filename-map filename-map.json
+```
+
+### 3. Plan the linked PE address space
+
+Create the deterministic multi-module load map and resolve Diablo DLL imports:
+
+```sh
+mkdir -p build
+./d2wasm.py link ../extracted \
+  --filename-map filename-map.json \
+  --entry-module "Diablo II.exe" \
+  --output build/diablo-link-compact.json
+```
+
+The verified input set plans 17 modules, relocates 16, resolves 760 internal
+bindings, and leaves zero unresolved internal imports.
+
+### 4. Translate the linked modules
+
+Build the complete gameplay artifact:
 
 ```sh
 ./d2wasm.py link-translate ../extracted \
@@ -41,19 +114,41 @@ while untranslated, unreachable diagnostic sites remain in the report):
   --opt-level 0
 ```
 
-`-O0` is intentional for this artifact: it preserves page-sized translated
-functions instead of letting LLVM fold the whole dispatcher into a single
-function larger than V8's per-function limit.
+An exit status of 2 is expected for this `--emit-partial` build: explicit
+diagnostic sites remain in unexercised branches, while `linked.wasm` is still
+successfully generated. Any other nonzero status is a build failure.
 
-Run the deterministic title-menu-to-gameplay replay with:
+`-O0` is intentional for this artifact. It preserves page-sized translated
+functions instead of letting LLVM fold the dispatcher into a function larger
+than V8's per-function limit.
+
+### 5. Run the deterministic gameplay path
 
 ```sh
 ./run-gameplay-demo.sh
 ```
 
-The script writes `build/diablo-gameplay.ppm`. Its click/text schedule and
-round budget can be overridden with `D2_AUTO_CLICKS`, `D2_AUTO_TEXT`, and
-`D2_MAIN_ROUNDS`.
+The default schedule selects the Barbarian, creates a character, and reaches
+the rainy Rogue Encampment. The script writes `build/diablo-gameplay.ppm`.
+Application status 1 at the end means the configured execution-fuel boundary
+was reached and the machine is resumable; it is not a crash.
+
+Override the replay inputs or output path with `D2_AUTO_CLICKS`, `D2_AUTO_TEXT`,
+`D2_MAIN_ROUNDS`, and `D2_FRAMEBUFFER_PPM`.
+
+## Other commands
+
+```sh
+# Inventory the real module set and write a machine-readable coverage report.
+./d2wasm.py inventory ../extracted --filename-map filename-map.json \
+  --output build/inventory.json
+
+# Lift a PE entry point, compile it, and emit translation diagnostics.
+./d2wasm.py translate some-i386.exe --output-dir build/some-i386
+
+# Run the hermetic PE -> Wasm behavioral smoke test.
+./tests/smoke.sh
+```
 
 To produce and execute a diagnostic Diablo entry-point artifact:
 
