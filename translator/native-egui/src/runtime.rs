@@ -167,6 +167,8 @@ pub struct Runtime {
     handles: HashMap<u32, Handle>,
     current_thread: Option<u32>,
     critical_sections: HashMap<u32, CriticalSectionState>,
+    message_box_counts: HashMap<(String, String), u64>,
+    message_box_trace_pending: bool,
     allocations: HashMap<u32, u32>,
     reserved_ranges: Vec<(u32, u32)>,
     module_handles: HashMap<String, u32>,
@@ -187,6 +189,7 @@ pub struct Runtime {
     cursor_x: i32,
     cursor_y: i32,
     auto_clicks: VecDeque<(i32, i32, u64)>,
+    auto_keys: VecDeque<(u32, u64)>,
     show_cursor_count: i32,
     virtual_time: u32,
     unknown_apis: HashSet<String>,
@@ -221,6 +224,19 @@ impl Runtime {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let auto_keys = std::env::var("D2_AUTO_KEYS")
+            .ok()
+            .into_iter()
+            .flat_map(|schedule| {
+                schedule
+                    .split(';')
+                    .filter_map(|item| {
+                        let mut fields = item.split(',');
+                        Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Self {
             last_error: 0,
             heap_cursor: heap_base,
@@ -230,6 +246,8 @@ impl Runtime {
             handles: HashMap::new(),
             current_thread: None,
             critical_sections: HashMap::new(),
+            message_box_counts: HashMap::new(),
+            message_box_trace_pending: false,
             allocations: HashMap::new(),
             reserved_ranges: Vec::new(),
             module_handles: HashMap::from([(String::from("<main>"), 0x0040_0000)]),
@@ -269,6 +287,7 @@ impl Runtime {
             cursor_x: 0,
             cursor_y: 0,
             auto_clicks,
+            auto_keys,
             show_cursor_count: 0,
             virtual_time: 0,
             unknown_apis: HashSet::new(),
@@ -433,15 +452,7 @@ impl Runtime {
                 );
             }
             InputEvent::Character(character) => {
-                let code = character as u32;
-                let virtual_key = if character.is_ascii_lowercase() {
-                    character.to_ascii_uppercase() as u32
-                } else {
-                    code
-                };
-                self.enqueue(0x0100, virtual_key, 1);
-                self.enqueue(0x0102, code, 1);
-                self.enqueue(0x0101, virtual_key, 1);
+                self.enqueue(0x0102, character as u32, 1);
             }
             InputEvent::Key { virtual_key, down } => {
                 self.enqueue(if down { 0x0100 } else { 0x0101 }, virtual_key, 1);
@@ -681,6 +692,29 @@ impl Runtime {
         let _ = self.event_tx.try_send(HostEvent::Log(message.into()));
     }
 
+    pub(super) fn message_box(&mut self, caption: String, text: String) {
+        let count = {
+            let count = self
+                .message_box_counts
+                .entry((caption.clone(), text.clone()))
+                .or_default();
+            *count += 1;
+            *count
+        };
+        if count == 1 {
+            self.message_box_trace_pending = true;
+            self.log(format!("MessageBoxA: {caption}: {text}"));
+        } else if count.is_power_of_two() {
+            self.log(format!(
+                "MessageBoxA duplicate #{count} (trace suppressed): {caption}: {text}"
+            ));
+        }
+    }
+
+    pub fn take_message_box_trace_request(&mut self) -> bool {
+        std::mem::take(&mut self.message_box_trace_pending)
+    }
+
     fn enqueue(&mut self, message: u32, w_param: u32, l_param: u32) {
         self.messages.push_back(Message {
             hwnd: self.active_window,
@@ -722,6 +756,36 @@ impl Runtime {
                 "Auto-clicked ({x},{y}) at presentation {}",
                 self.screen_presentations
             )));
+        }
+        if let Some(&(virtual_key, presentation)) = self.auto_keys.front()
+            && self.screen_presentations >= presentation
+        {
+            self.auto_keys.pop_front();
+            let generated = vec![
+                InputEvent::Key {
+                    virtual_key,
+                    down: true,
+                },
+                InputEvent::Key {
+                    virtual_key,
+                    down: false,
+                },
+            ];
+            match self
+                .gameplay
+                .process_inputs(self.screen_presentations, generated)
+            {
+                Ok(inputs) => {
+                    for event in inputs {
+                        self.apply_input(event);
+                    }
+                }
+                Err(error) => self.handle_gameplay_error(error),
+            }
+            self.log(format!(
+                "Auto-pressed virtual key {virtual_key:#x} at presentation {}",
+                self.screen_presentations
+            ));
         }
         let width = bitmap.width.max(1) as usize;
         let height = bitmap.height.max(1) as usize;

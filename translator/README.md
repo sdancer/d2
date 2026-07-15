@@ -177,6 +177,11 @@ D2_EGUI_MODULE_CACHE=/dev/shm/d2-linked.cwasm \
 
 For deterministic UI diagnostics, `D2_AUTO_CLICKS` uses the same
 `x,y,presentation` schedule syntax as the Node replay.
+`D2_AUTO_KEYS` accepts `virtual-key,presentation` entries separated by
+semicolons, for example `D2_AUTO_KEYS='67,1500'` to press `C` at presentation
+1500.
+Set `D2_WATCH_PC` to a lifted basic-block address and
+`D2_STOP_ON_WATCH=1` to yield with its guest registers and stack intact.
 
 ### Record and replay native gameplay
 

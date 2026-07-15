@@ -11,9 +11,7 @@ impl Runtime {
             "MessageBoxA" => {
                 let text = self.read_c_string(memory, arg(memory, sp, 1));
                 let caption = self.read_c_string(memory, arg(memory, sp, 2));
-                let _ = self
-                    .event_tx
-                    .try_send(HostEvent::Log(format!("MessageBoxA: {caption}: {text}")));
+                self.message_box(caption, text);
                 1
             }
             "LoadStringA" => {

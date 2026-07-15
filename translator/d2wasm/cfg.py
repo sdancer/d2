@@ -175,8 +175,28 @@ def discover_cfg(image: PEImage, roots: list[int], max_blocks: int = 100_000) ->
             for volatile in ("eax", "ecx", "edx"):
                 next_constants.pop(volatile, None)
                 next_imported.pop(volatile, None)
-        if target not in entry_states:
+        previous = entry_states.get(target)
+        if previous is None:
             entry_states[target] = (next_constants, next_imported)
+        else:
+            merged_constants = {
+                register: value
+                for register, value in previous[0].items()
+                if next_constants.get(register) == value
+            }
+            merged_imported = {
+                register: symbol
+                for register, symbol in previous[1].items()
+                if next_imported.get(register) == symbol
+            }
+            merged = (merged_constants, merged_imported)
+            if merged != previous:
+                entry_states[target] = merged
+                # Register facts only become less specific as new incoming
+                # edges are found. Rebuild a block that was emitted from an
+                # earlier, unsafely specific predecessor state and propagate
+                # the weaker state through its successors.
+                blocks.pop(target, None)
         pending.append(target)
 
     while pending and len(blocks) < max_blocks:
@@ -195,6 +215,11 @@ def discover_cfg(image: PEImage, roots: list[int], max_blocks: int = 100_000) ->
 
         # Bound a malformed/data run while still allowing large compiler blocks.
         for _ in range(4096):
+            if cursor != start and cursor in entry_states:
+                terminator = "fallthrough"
+                successors = [cursor]
+                enqueue(cursor, constants, imported_registers)
+                break
             try:
                 data = image.bytes_at_rva(cursor, 15)
             except ValueError as error:

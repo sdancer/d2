@@ -175,7 +175,36 @@ _crypt_inner:
         movl $116, %ebx
         cmpl $0x31a5e829, _crypt_table+0x510
         jne _failed
+
+        # Constants from different sides of a diamond must be merged at the
+        # indirect-call block. Keeping only the first predecessor hard-codes
+        # the wrong callee (the D2 stats-panel MAXHP/MAXMANA regression).
+        xorl %eax, %eax
+        testl %eax, %eax
+        je _indirect_test
+        call _indirect_good
+        call _indirect_bad
+_indirect_test:
+        xorl %ecx, %ecx
+        cmpl $1, %ecx
+        movl $_indirect_bad, %edx
+        je _indirect_join
+        movl $_indirect_good, %edx
+_indirect_join:
+        call *%edx
+        movl $120, %ebx
+        cmpl $0x13579bdf, %eax
+        jne _failed
+
         movl $42, %eax
+        retl
+
+_indirect_good:
+        movl $0x13579bdf, %eax
+        retl
+
+_indirect_bad:
+        movl $0x2468ace0, %eax
         retl
 
 _failed:

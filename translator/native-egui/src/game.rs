@@ -177,6 +177,11 @@ pub fn run(
                 wt(instance.get_typed_func::<u32, ()>(&mut store, "d2_set_watch_skip"))?;
             wt(set_watch_skip.call(&mut store, skip))?;
         }
+        if environment_u32("D2_STOP_ON_WATCH")?.unwrap_or(0) != 0 {
+            let set_stop_on_watch =
+                wt(instance.get_typed_func::<u32, ()>(&mut store, "d2_set_stop_on_watch"))?;
+            wt(set_stop_on_watch.call(&mut store, 1))?;
+        }
         send(
             &event_tx,
             HostEvent::Log(format!("Watching translated PC {value:#010x}")),
@@ -321,8 +326,17 @@ fn context_watch_report(memory: &[u8], thread: u32, context: u32) -> Option<Stri
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let stack = (-8i32..=16)
+        .map(|index| {
+            let offset = index * 4;
+            let address = esp.wrapping_add(offset as u32);
+            let value = read_u32(memory, address).unwrap_or(0);
+            format!("    [{address:#010x} esp{offset:+#x}] = {value:#010x}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     Some(format!(
-        "Translated watch hit: thread={thread:#x}, context={context:#010x}\n  {register_text}\n  {object}\n  {arguments}"
+        "Translated watch hit: thread={thread:#x}, context={context:#010x}\n  {register_text}\n  {object}\n  {arguments}\n  stack:\n{stack}"
     ))
 }
 
@@ -401,7 +415,10 @@ fn register_imports(module: &Module, linker: &mut Linker<HostState>) -> Result<(
                         .dispatch(&callback_library, &callback_name, sp, bytes)
                         .map_err(|error| WasmtimeError::msg(format!("{error:#}")))?
                 };
-                if callback_library == "win32.user32.dll" && callback_name == "MessageBoxA" {
+                if callback_library == "win32.user32.dll"
+                    && callback_name == "MessageBoxA"
+                    && caller.data_mut().runtime.take_message_box_trace_request()
+                {
                     let trace = capture_assertion_trace(&mut caller)?;
                     eprintln!("MessageBoxA translated trace:\n{trace}");
                     caller
