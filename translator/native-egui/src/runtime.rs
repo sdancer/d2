@@ -111,6 +111,46 @@ struct ThreadState {
     finished: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CriticalSectionState {
+    owner: u32,
+    recursion: u32,
+}
+
+impl CriticalSectionState {
+    fn try_enter(&mut self, thread: u32) -> bool {
+        if self.owner == 0 {
+            self.owner = thread;
+            self.recursion = 1;
+            true
+        } else if self.owner == thread {
+            self.recursion += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn leave(&mut self, thread: u32) -> Result<()> {
+        if self.owner != thread || self.recursion == 0 {
+            bail!(
+                "critical section leave by thread {thread:#x}, owner is {:#x} with recursion {}",
+                self.owner,
+                self.recursion
+            );
+        }
+        self.recursion -= 1;
+        if self.recursion == 0 {
+            self.owner = 0;
+        }
+        Ok(())
+    }
+
+    fn may_delete(&self, thread: u32) -> bool {
+        self.owner == 0 || self.owner == thread
+    }
+}
+
 #[derive(Debug)]
 struct FindState {
     directory: PathBuf,
@@ -126,6 +166,7 @@ pub struct Runtime {
     tls: HashMap<u32, u32>,
     handles: HashMap<u32, Handle>,
     current_thread: Option<u32>,
+    critical_sections: HashMap<u32, CriticalSectionState>,
     allocations: HashMap<u32, u32>,
     reserved_ranges: Vec<(u32, u32)>,
     module_handles: HashMap<String, u32>,
@@ -188,6 +229,7 @@ impl Runtime {
             tls: HashMap::new(),
             handles: HashMap::new(),
             current_thread: None,
+            critical_sections: HashMap::new(),
             allocations: HashMap::new(),
             reserved_ranges: Vec::new(),
             module_handles: HashMap::from([(String::from("<main>"), 0x0040_0000)]),
@@ -364,8 +406,7 @@ impl Runtime {
         {
             Ok(inputs) => inputs,
             Err(error) => {
-                self.log(format!("Deterministic replay failed: {error:#}"));
-                self.quit_requested = true;
+                self.handle_gameplay_error(error);
                 return;
             }
         };
@@ -435,6 +476,100 @@ impl Runtime {
         self.current_thread.is_some()
     }
 
+    fn handle_gameplay_error(&mut self, error: anyhow::Error) {
+        if self.gameplay.is_replay() {
+            self.log(format!(
+                "Replay stopped at first divergence; guest remains live: {error:#}"
+            ));
+            self.gameplay.stop_replay();
+        } else {
+            self.log(format!("Gameplay recording failed: {error:#}"));
+            self.quit_requested = true;
+        }
+    }
+
+    pub(super) fn initialize_critical_section(
+        &mut self,
+        pointer: u32,
+        memory: &mut [u8],
+    ) -> Result<()> {
+        self.critical_sections
+            .insert(pointer, CriticalSectionState::default());
+        let start = pointer as usize;
+        let section = memory
+            .get_mut(start..start + 24)
+            .with_context(|| format!("critical section {pointer:#010x} is outside guest memory"))?;
+        section.fill(0);
+        write_i32(memory, pointer + 4, -1)?;
+        Ok(())
+    }
+
+    pub(super) fn delete_critical_section(
+        &mut self,
+        pointer: u32,
+        memory: &mut [u8],
+    ) -> Result<()> {
+        let thread = self.current_thread_id();
+        if let Some(section) = self.critical_sections.get(&pointer)
+            && !section.may_delete(thread)
+        {
+            bail!(
+                "critical section {pointer:#010x} deleted by thread {thread:#x} while owned by {:#x} (recursion {})",
+                section.owner,
+                section.recursion
+            );
+        }
+        self.critical_sections.remove(&pointer);
+        if let Some(section) = memory.get_mut(pointer as usize..pointer as usize + 24) {
+            section.fill(0);
+        }
+        Ok(())
+    }
+
+    pub(super) fn enter_critical_section(&mut self, pointer: u32, memory: &mut [u8]) -> Result<()> {
+        let thread = self.current_thread_id();
+        let section = self.critical_sections.entry(pointer).or_default();
+        if !section.try_enter(thread) {
+            let message = format!(
+                "critical section contention at {pointer:#010x}: thread {thread:#x} entered while owned by {:#x}",
+                section.owner
+            );
+            eprintln!("{message}");
+            self.log(&message);
+            bail!(message);
+        }
+        write_i32(memory, pointer + 4, 0)?;
+        write_u32(memory, pointer + 8, section.recursion)?;
+        write_u32(memory, pointer + 12, section.owner)?;
+        Ok(())
+    }
+
+    pub(super) fn leave_critical_section(&mut self, pointer: u32, memory: &mut [u8]) -> Result<()> {
+        let thread = self.current_thread_id();
+        let section = self
+            .critical_sections
+            .get_mut(&pointer)
+            .with_context(|| format!("leaving uninitialized critical section {pointer:#010x}"))?;
+        section.leave(thread)?;
+        if section.owner == 0 {
+            write_i32(memory, pointer + 4, -1)?;
+            write_u32(memory, pointer + 8, 0)?;
+            write_u32(memory, pointer + 12, 0)?;
+        } else {
+            write_i32(memory, pointer + 4, 0)?;
+            write_u32(memory, pointer + 8, section.recursion)?;
+            write_u32(memory, pointer + 12, section.owner)?;
+        }
+        Ok(())
+    }
+
+    pub fn background_critical_owner(&self) -> Option<u32> {
+        self.critical_sections
+            .values()
+            .filter_map(|section| (section.owner > 1).then_some(section.owner))
+            .min()
+    }
+
     pub fn wait_immediate(&mut self, handle: u32) -> bool {
         match self.handles.get_mut(&handle) {
             Some(Handle::Event {
@@ -452,6 +587,12 @@ impl Runtime {
     }
 
     pub fn wait_threads(&self, target: u32) -> Vec<u32> {
+        if let Some(owner) = self.background_critical_owner() {
+            return match self.handles.get(&owner) {
+                Some(Handle::Thread(thread)) if !thread.finished => vec![owner],
+                _ => Vec::new(),
+            };
+        }
         if let Some(Handle::Thread(thread)) = self.handles.get(&target) {
             return if thread.finished {
                 Vec::new()
@@ -485,6 +626,11 @@ impl Runtime {
     }
 
     pub fn begin_thread_run(&mut self, handle: u32) -> Option<ThreadRun> {
+        if let Some(owner) = self.background_critical_owner()
+            && owner != handle
+        {
+            return None;
+        }
         let Handle::Thread(thread) = self.handles.get(&handle)? else {
             return None;
         };
@@ -569,8 +715,7 @@ impl Runtime {
                     }
                 }
                 Err(error) => {
-                    self.log(format!("Gameplay recording failed: {error:#}"));
-                    self.quit_requested = true;
+                    self.handle_gameplay_error(error);
                 }
             }
             let _ = self.event_tx.try_send(HostEvent::Log(format!(
@@ -603,8 +748,7 @@ impl Runtime {
             height,
             &rgba,
         ) {
-            self.log(format!("Deterministic replay failed: {error:#}"));
-            self.quit_requested = true;
+            self.handle_gameplay_error(error);
         }
         let _ = self.event_tx.try_send(HostEvent::Frame {
             width,
@@ -723,6 +867,29 @@ impl Runtime {
             }
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod critical_section_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_is_recursive_and_exclusive() -> Result<()> {
+        let mut section = CriticalSectionState::default();
+        assert!(section.try_enter(0x101));
+        assert!(section.try_enter(0x101));
+        assert!(!section.try_enter(0x202));
+        assert_eq!(section.owner, 0x101);
+        assert_eq!(section.recursion, 2);
+        section.leave(0x101)?;
+        assert_eq!(section.owner, 0x101);
+        section.leave(0x101)?;
+        assert_eq!(section.owner, 0);
+        assert!(section.try_enter(0x202));
+        assert!(section.may_delete(0x202));
+        assert!(!section.may_delete(0x101));
+        Ok(())
     }
 }
 

@@ -197,8 +197,9 @@ The journal is line-delimited JSON. Its header fingerprints the linked Wasm,
 link manifest, mapped PE source images, and MPQ/LNG game data. Input records
 contain the presentation number and a strict sequence number; frame records
 contain the virtual Win32 clock and an FNV-1a checksum of the 800x600 RGBA
-framebuffer. Replay stops with the first divergent presentation instead of
-silently continuing with different state.
+framebuffer. Replay validation and recorded input stop at the first divergent
+presentation; the same guest and window remain running and immediately accept
+live input, with the mismatch preserved in the host diagnostics.
 
 Recording also creates `barbarian.jsonl.state`, a snapshot of the initial
 `Save` directory. Replay runs from a private temporary copy of that snapshot,

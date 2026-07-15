@@ -173,6 +173,13 @@ impl GameplaySession {
         matches!(self.journal, Journal::Replay { .. })
     }
 
+    pub fn stop_replay(&mut self) {
+        if self.is_replay() {
+            self.journal = Journal::Disabled;
+            self.description = String::from("live (replay stopped at divergence)");
+        }
+    }
+
     pub fn save_root(&self) -> Option<&Path> {
         self.save_root.as_deref()
     }
@@ -610,6 +617,10 @@ mod tests {
             .checkpoint(7, 112, 1, 1, &[4, 3, 2, 0xff])
             .expect_err("different framebuffer must be rejected");
         assert!(error.to_string().contains("framebuffer diverged"));
+        divergent.stop_replay();
+        assert!(!divergent.is_replay());
+        let live = InputEvent::PointerMoved { x: 30, y: 40 };
+        assert_eq!(divergent.process_inputs(8, vec![live.clone()])?, vec![live]);
         drop(divergent);
         fs::remove_dir_all(root)?;
         Ok(())

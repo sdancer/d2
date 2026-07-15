@@ -120,10 +120,22 @@ impl Runtime {
                 write_i32(memory, pointer, value)?;
                 Ok(value as u32)
             }
-            "InitializeCriticalSection"
-            | "DeleteCriticalSection"
-            | "EnterCriticalSection"
-            | "LeaveCriticalSection" => Ok(0),
+            "InitializeCriticalSection" => {
+                self.initialize_critical_section(arg(memory, sp, 0), memory)?;
+                Ok(0)
+            }
+            "DeleteCriticalSection" => {
+                self.delete_critical_section(arg(memory, sp, 0), memory)?;
+                Ok(0)
+            }
+            "EnterCriticalSection" => {
+                self.enter_critical_section(arg(memory, sp, 0), memory)?;
+                Ok(0)
+            }
+            "LeaveCriticalSection" => {
+                self.leave_critical_section(arg(memory, sp, 0), memory)?;
+                Ok(0)
+            }
             "TlsAlloc" => {
                 let value = self.next_tls;
                 self.next_tls += 1;

@@ -514,7 +514,9 @@ fn run_wait(
     caller: &mut Caller<'_, HostState>,
     request: WaitRequest,
 ) -> Result<u32, WasmtimeError> {
-    if caller.data_mut().runtime.wait_immediate(request.handle) {
+    if caller.data().runtime.background_critical_owner().is_none()
+        && caller.data_mut().runtime.wait_immediate(request.handle)
+    {
         return Ok(0);
     }
     if caller.data().runtime.is_running_thread() {
@@ -522,9 +524,18 @@ fn run_wait(
         return Ok(if request.timeout == u32::MAX { 0 } else { 258 });
     }
 
-    let threads = caller.data().runtime.wait_threads(request.handle);
-    for _ in 0..32 {
+    for round in 0..4096 {
+        let owner = caller.data().runtime.background_critical_owner();
+        if round >= 32 && owner.is_none() {
+            break;
+        }
+        let threads = caller.data().runtime.wait_threads(request.handle);
         if threads.is_empty() {
+            if let Some(owner) = owner {
+                return Err(WasmtimeError::msg(format!(
+                    "thread {owner:#x} stopped while owning a critical section"
+                )));
+            }
             break;
         }
         for handle in &threads {
@@ -542,10 +553,17 @@ fn run_wait(
                     return Err(error);
                 }
             }
-            if caller.data_mut().runtime.wait_immediate(request.handle) {
+            if caller.data().runtime.background_critical_owner().is_none()
+                && caller.data_mut().runtime.wait_immediate(request.handle)
+            {
                 return Ok(0);
             }
         }
+    }
+    if let Some(owner) = caller.data().runtime.background_critical_owner() {
+        return Err(WasmtimeError::msg(format!(
+            "critical section owner {owner:#x} did not release after 4096 scheduler rounds"
+        )));
     }
     Ok(if request.timeout == 0 { 258 } else { 0 })
 }
@@ -633,5 +651,5 @@ fn send(sender: &SyncSender<HostEvent>, event: HostEvent) {
 }
 
 fn wt<T>(result: wasmtime::Result<T>) -> Result<T> {
-    result.map_err(|error| anyhow::anyhow!(error.to_string()))
+    result.map_err(|error| anyhow::anyhow!(format!("{error:#}")))
 }
