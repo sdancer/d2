@@ -97,6 +97,32 @@ struct Message {
     l_param: u32,
 }
 
+#[derive(Clone, Debug)]
+struct WaveFormat {
+    format_tag: u16,
+    channels: u16,
+    samples_per_second: u32,
+    average_bytes_per_second: u32,
+    block_align: u16,
+    bits_per_sample: u16,
+}
+
+#[derive(Debug)]
+struct SoundBuffer {
+    id: u32,
+    primary: bool,
+    flags: u32,
+    size: u32,
+    bytes: u32,
+    format: WaveFormat,
+    volume: i32,
+    pan: i32,
+    frequency: u32,
+    playing: bool,
+    play_flags: u32,
+    play_started: u32,
+}
+
 #[derive(Debug)]
 struct FileHandle {
     file: File,
@@ -364,6 +390,9 @@ pub struct Runtime {
     show_cursor_count: i32,
     virtual_time: u32,
     clock_origin: Instant,
+    direct_sound_objects: HashSet<u32>,
+    sound_buffers: HashMap<u32, SoundBuffer>,
+    next_sound_id: u32,
     unknown_apis: HashSet<String>,
     event_tx: SyncSender<HostEvent>,
     input_rx: Receiver<InputEvent>,
@@ -469,6 +498,9 @@ impl Runtime {
             show_cursor_count: 0,
             virtual_time: 0,
             clock_origin: Instant::now(),
+            direct_sound_objects: HashSet::new(),
+            sound_buffers: HashMap::new(),
+            next_sound_id: 1,
             unknown_apis: HashSet::new(),
             event_tx,
             input_rx,
@@ -555,13 +587,7 @@ impl Runtime {
             "win32.version.dll" => self.version(name, sp, memory)?,
             "win32.imm32.dll" => self.imm32(name, sp, memory)?,
             "win32.wsock32.dll" => self.wsock32(name, sp, memory)?,
-            "win32.dsound.dll" => {
-                let output = arg(memory, sp, 1);
-                if output != 0 {
-                    write_u32(memory, output, 0)?;
-                }
-                0x8878_0078
-            }
+            "win32.dsound.dll" => self.dsound(name, sp, memory)?,
             "win32.winmm.dll" => self.clock_now(),
             _ => self.unknown(library, name, 0),
         };
@@ -571,14 +597,12 @@ impl Runtime {
     pub fn dispatch_direct_sound(
         &mut self,
         method: u32,
-        _sp: u32,
-        _memory: &mut [u8],
+        sp: u32,
+        memory: &mut [u8],
     ) -> Result<DispatchResult> {
-        Ok(DispatchResult::Value(self.unknown(
-            "win32.dsound.dll",
-            &format!("__dispatch[{method}]"),
-            0x8878_0078,
-        )))
+        Ok(DispatchResult::Value(
+            self.dispatch_dsound_method(method, sp, memory)?,
+        ))
     }
 
     fn unknown(&mut self, library: &str, name: &str, fallback: u32) -> u32 {
@@ -1423,6 +1447,7 @@ fn write_i32(memory: &mut [u8], pointer: u32, value: i32) -> Result<()> {
     write_u32(memory, pointer, value as u32)
 }
 
+mod dsound;
 mod gdi32;
 mod kernel32;
 mod misc;

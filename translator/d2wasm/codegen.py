@@ -1084,10 +1084,40 @@ def _render_c(pages: dict[int, list[str]], used_apis: dict[str, ApiSpec]) -> str
             ]
         lines.append("  }")
         host_thunk_dispatch.extend(lines)
+    has_dsound = any(key.lower() == "dsound.dll!#1" for key in used_apis)
+    dsound_import = (
+        '__attribute__((import_module("win32.dsound.dll"), import_name("__dispatch"))) '
+        'extern uint32_t api_dsound_dispatch(uint32_t, uint32_t);'
+        if has_dsound else ""
+    )
+    dsound_helpers = r'''
+#define D2_DSOUND_PC_BASE 0xfffe0000u
+static uint32_t d2_dsound_arg_bytes(uint32_t method) {
+  static const uint8_t direct_sound[] = { 12, 4, 4, 16, 8, 12, 12, 4, 8, 8, 8 };
+  static const uint8_t sound_buffer[] = { 12, 4, 4, 8, 12, 16, 8, 8, 8, 8, 12, 32, 16, 8, 8, 8, 8, 8, 4, 20, 4 };
+  if (method < sizeof(direct_sound)) return direct_sound[method];
+  if (method >= 32u && method - 32u < sizeof(sound_buffer)) return sound_buffer[method - 32u];
+  return 4u;
+}
+''' if has_dsound else ""
+    dsound_dispatch = r'''
+  if (pc >= D2_DSOUND_PC_BASE && pc < D2_DSOUND_PC_BASE + 53u * 4u) {
+    uint32_t method = (pc - D2_DSOUND_PC_BASE) / 4u;
+    uint32_t return_pc = load32(esp);
+    eax = api_dsound_dispatch(method, esp + 4u);
+    esp += 4u + d2_dsound_arg_bytes(method);
+    d2_next_pc = return_pc;
+    if (return_pc == D2_RETURN_SENTINEL) { d2_status = D2_STATUS_OK; return D2_ACTION_RETURN; }
+    return D2_ACTION_CONTINUE;
+  }
+''' if has_dsound else ""
     return (
         C_TEMPLATE.replace("@IMPORTS@", "\n".join(imports))
         .replace("@HOST_THUNK_BASE@", f"{HOST_THUNK_BASE:08x}")
         .replace("@HOST_THUNK_DISPATCH@", "\n".join(host_thunk_dispatch))
+        .replace("@DSOUND_IMPORT@", dsound_import)
+        .replace("@DSOUND_HELPERS@", dsound_helpers)
+        .replace("@DSOUND_DISPATCH@", dsound_dispatch)
         .replace("@SHARDS@", "\n".join(shards))
         .replace("@PAGE_DISPATCH@", "\n".join(page_dispatch))
     )
@@ -1096,6 +1126,7 @@ def _render_c(pages: dict[int, list[str]], used_apis: dict[str, ApiSpec]) -> str
 C_TEMPLATE = r'''#include <stdint.h>
 
 @IMPORTS@
+@DSOUND_IMPORT@
 
 enum {
   D2_STATUS_OK = 0,
@@ -1254,6 +1285,8 @@ static inline void flags_inc(uint32_t a, uint32_t result, uint32_t bits) {
 static inline void flags_dec(uint32_t a, uint32_t result, uint32_t bits) {
   uint32_t old_cf = cf; flags_sub32(a, 1u, result, bits); cf = old_cf;
 }
+
+@DSOUND_HELPERS@
 static inline void flags_adc(uint32_t a, uint32_t b, uint32_t result, uint32_t carry, uint32_t bits) {
   uint32_t mask = width_mask(bits), effective = (b + carry) & mask, sign = 1u << (bits - 1u);
   flags_result32(result, bits); cf = ((uint64_t)(a & mask) + (uint64_t)(b & mask) + carry) > mask;
@@ -1353,6 +1386,7 @@ static uint32_t d2_dispatch_block(uint32_t pc, uint32_t *block_fuel) {
   for (;;) {
     if (pc >= 0x@HOST_THUNK_BASE@u) {
       D2_BEGIN_BLOCK(pc, block_fuel);
+@DSOUND_DISPATCH@
 @HOST_THUNK_DISPATCH@
       d2_status = D2_STATUS_MISSING_BLOCK;
       return D2_ACTION_RETURN;

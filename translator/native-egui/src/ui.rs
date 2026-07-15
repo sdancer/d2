@@ -1,6 +1,56 @@
 use crate::protocol::{HostEvent, InputEvent};
 use eframe::egui;
-use std::sync::mpsc::{Receiver, Sender};
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source, buffer::SamplesBuffer};
+use std::{
+    collections::HashMap,
+    num::NonZero,
+    sync::mpsc::{Receiver, Sender},
+};
+
+struct AudioOutput {
+    stream: MixerDeviceSink,
+    players: HashMap<u32, Player>,
+}
+
+impl AudioOutput {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            stream: DeviceSinkBuilder::open_default_sink().map_err(|error| error.to_string())?,
+            players: HashMap::new(),
+        })
+    }
+
+    fn play(
+        &mut self,
+        id: u32,
+        channels: u16,
+        sample_rate: u32,
+        samples: Vec<f32>,
+        looping: bool,
+        volume: f32,
+    ) {
+        self.stop(id);
+        let source = SamplesBuffer::new(
+            NonZero::new(channels.max(1)).expect("non-zero channels"),
+            NonZero::new(sample_rate.max(1)).expect("non-zero sample rate"),
+            samples,
+        );
+        let player = Player::connect_new(self.stream.mixer());
+        player.set_volume(volume);
+        if looping {
+            player.append(source.repeat_infinite());
+        } else {
+            player.append(source);
+        }
+        self.players.insert(id, player);
+    }
+
+    fn stop(&mut self, id: u32) {
+        if let Some(player) = self.players.remove(&id) {
+            player.stop();
+        }
+    }
+}
 
 pub struct D2App {
     events: Receiver<HostEvent>,
@@ -11,11 +61,14 @@ pub struct D2App {
     presentation: u64,
     status: String,
     logs: Vec<String>,
+    audio: Option<AudioOutput>,
 }
 
 impl D2App {
     pub fn new(events: Receiver<HostEvent>, input: Sender<InputEvent>) -> Self {
-        Self {
+        let audio = AudioOutput::new();
+        let audio_error = audio.as_ref().err().cloned();
+        let mut app = Self {
             events,
             input,
             texture: None,
@@ -24,7 +77,12 @@ impl D2App {
             presentation: 0,
             status: String::from("Starting native host…"),
             logs: Vec::new(),
+            audio: audio.ok(),
+        };
+        if let Some(error) = audio_error {
+            app.logs.push(format!("Audio output unavailable: {error}"));
         }
+        app
     }
 
     fn receive(&mut self, context: &egui::Context) {
@@ -52,6 +110,23 @@ impl D2App {
                     self.input_size = [input_width, input_height];
                     self.presentation = presentation;
                     context.request_repaint();
+                }
+                HostEvent::AudioPlay {
+                    id,
+                    channels,
+                    sample_rate,
+                    samples,
+                    looping,
+                    volume,
+                } => {
+                    if let Some(audio) = &mut self.audio {
+                        audio.play(id, channels, sample_rate, samples, looping, volume);
+                    }
+                }
+                HostEvent::AudioStop { id } => {
+                    if let Some(audio) = &mut self.audio {
+                        audio.stop(id);
+                    }
                 }
                 HostEvent::Status(status) => self.status = status,
                 HostEvent::Log(log) => {

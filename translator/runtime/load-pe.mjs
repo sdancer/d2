@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import { hostFs as fs } from "./host-platform.mjs";
 
 export function mapPeImage(memory, peBytes, inventory) {
   const loadBase = inventory.load_base ?? inventory.image_base;
