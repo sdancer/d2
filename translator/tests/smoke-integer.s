@@ -39,6 +39,19 @@ _entry:
         movl $109, %ebx
         jo _failed
 
+        # Three-operand 16-bit IMUL is used by Diablo II's interaction layout.
+        movw $7, %cx
+        imulw $15, %cx, %cx
+        movl $117, %ebx
+        cmpw $105, %cx
+        jne _failed
+        movl $118, %ebx
+        jo _failed
+        movw $0x4000, %cx
+        imulw $4, %cx, %cx
+        movl $119, %ebx
+        jno _failed
+
         movl $126, %eax
         cdq
         movl $3, %ecx

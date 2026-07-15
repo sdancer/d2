@@ -12,6 +12,7 @@ from .analysis import instruction_surface
 from .api import load_api_specs
 from .cfg import discover_cfg
 from .codegen import CGenerator, LinkedCGenerator, compile_wasm
+from .debugdb import DebugUnit, write_debug_database
 from .linker import plan_linked_image
 from .pe import PEImage
 
@@ -218,6 +219,7 @@ def link_translate(args: argparse.Namespace) -> int:
         roots_by_module.setdefault(binding["target_module"].lower(), set()).add(int(binding["target_rva"]))
 
     units = []
+    debug_units = []
     module_reports = []
     relocation_root_modules = {name.lower() for name in (args.relocation_roots_module or [])}
     unknown_relocation_modules = relocation_root_modules - set(known_modules)
@@ -242,6 +244,16 @@ def link_translate(args: argparse.Namespace) -> int:
             internal_targets=bindings_by_importer.get(module["runtime_name"].lower()),
         )
         units.append(unit)
+        debug_units.append(
+            DebugUnit(
+                runtime_name=module["runtime_name"],
+                source=module["source"],
+                load_base=int(module["load_base"]),
+                roots=tuple(sorted(roots)),
+                image=image,
+                blocks=blocks,
+            )
+        )
         module_reports.append(
             {
                 "runtime_name": module["runtime_name"],
@@ -254,9 +266,24 @@ def link_translate(args: argparse.Namespace) -> int:
             }
         )
 
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    debug_path = None
+    if args.debug_db:
+        debug_path = args.debug_db
+        if not debug_path.is_absolute() and debug_path.parent == Path("."):
+            debug_path = args.output_dir / debug_path
+        write_debug_database(debug_path, manifest, debug_units)
+    if args.debug_db_only:
+        if debug_path is None:
+            raise ValueError("--debug-db-only requires --debug-db")
+        print(
+            f"Indexed {sum(len(unit.blocks) for unit in debug_units)} linked blocks "
+            f"into {debug_path}"
+        )
+        return 0
+
     generator = LinkedCGenerator(units)
     source = generator.generate()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     source_path = args.output_dir / "linked.c"
     wasm_path = args.output_dir / "linked.wasm"
     report_path = args.output_dir / "linked-translation.json"
@@ -279,7 +306,11 @@ def link_translate(args: argparse.Namespace) -> int:
             for unit, module in zip(units, module_reports)
             for site in unit.unsupported
         ],
-        "artifacts": {"c": source_path.name, "wasm": wasm_path.name},
+        "artifacts": {
+            "c": source_path.name,
+            "wasm": wasm_path.name,
+            **({"debug_db": str(debug_path)} if debug_path else {}),
+        },
     }
     write_json(report_path, report)
     if generator.unsupported and not args.emit_partial:
@@ -336,6 +367,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="seed PE-relocation-proven code pointers for one module (repeatable)",
     )
     linked_parser.add_argument("--emit-partial", action="store_true")
+    linked_parser.add_argument(
+        "--debug-db",
+        type=Path,
+        nargs="?",
+        const=Path("linked-debug.sqlite"),
+        help="write a SQLite sidecar containing instructions, CFG edges, and resolved xrefs",
+    )
+    linked_parser.add_argument(
+        "--debug-db-only",
+        action="store_true",
+        help="discover linked code and write --debug-db without generating C or compiling Wasm",
+    )
     linked_parser.add_argument(
         "--api-spec",
         type=Path,

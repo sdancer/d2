@@ -411,11 +411,28 @@ class CGenerator:
             destination = operands[0]
             left = self._read(instruction, destination if len(operands) == 2 else operands[1])
             right = self._read(instruction, operands[1] if len(operands) == 2 else operands[2])
-            if left is None or right is None or left[1] != 32:
-                self._fail(instruction, "two/three-operand imul currently requires a 32-bit destination")
+            bits = int(destination.size) * 8
+            if (
+                left is None
+                or right is None
+                or bits not in (8, 16, 32)
+                or left[1] != bits
+                or right[1] != bits
+            ):
+                self._fail(
+                    instruction,
+                    "two/three-operand imul requires equal 8-, 16-, or 32-bit operands",
+                )
                 return None
             write = self._write(instruction, destination, "result")
-            return [f"wide_result = (int64_t)(int32_t)({left[0]}) * (int64_t)(int32_t)({right[0]});", "result = (uint32_t)wide_result;", "cf = of = wide_result != (int64_t)(int32_t)result;", write] if write else None
+            return [
+                f"wide_result = (int64_t)(int{bits}_t)({left[0]}) * "
+                f"(int64_t)(int{bits}_t)({right[0]});",
+                f"result = (uint32_t)wide_result & 0x{_mask(bits):x}u;",
+                f"cf = of = wide_result != (int64_t)(int{bits}_t)"
+                f"((uint{bits}_t)result);",
+                write,
+            ] if write else None
         if mnemonic == "div" and len(operands) == 1:
             divisor = self._read(instruction, operands[0])
             if divisor is None or divisor[1] != 32:
@@ -906,7 +923,8 @@ static uint32_t d2_status, d2_last_pc, d2_previous_pc, d2_next_pc;
 static uint64_t d2_tsc;
 static const char d2_dsound_description[] = "D2Wasm DirectSound";
 static const char d2_dsound_module[] = "dsound.dll";
-static uint32_t d2_trace_pc[1024], d2_trace_esp[1024], d2_trace_index;
+enum { D2_TRACE_CAPACITY = 16384u, D2_TRACE_MASK = D2_TRACE_CAPACITY - 1u };
+static uint32_t d2_trace_pc[D2_TRACE_CAPACITY], d2_trace_esp[D2_TRACE_CAPACITY], d2_trace_index;
 static uint32_t d2_watch_pc, d2_watch_hit, d2_watch_registers[8], d2_stop_on_watch, d2_watch_skip;
 static uint32_t d2_count_pc, d2_count_hits;
 static uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp, fs_base;
@@ -1139,8 +1157,8 @@ static uint32_t d2_execute(uint32_t block_fuel) {
   while (block_fuel--) {
     d2_previous_pc = d2_last_pc;
     d2_last_pc = d2_next_pc;
-    d2_trace_pc[d2_trace_index & 1023u] = d2_next_pc;
-    d2_trace_esp[d2_trace_index & 1023u] = esp;
+    d2_trace_pc[d2_trace_index & D2_TRACE_MASK] = d2_next_pc;
+    d2_trace_esp[d2_trace_index & D2_TRACE_MASK] = esp;
     d2_trace_index++;
     if (d2_next_pc == d2_count_pc) d2_count_hits++;
     if (!d2_watch_hit && d2_next_pc == d2_watch_pc) {
@@ -1285,13 +1303,19 @@ __attribute__((export_name("d2_previous_rva")))
 uint32_t d2_previous_rva(void) { return d2_previous_pc; }
 
 __attribute__((export_name("d2_trace_count")))
-uint32_t d2_trace_count(void) { return d2_trace_index < 1024u ? d2_trace_index : 1024u; }
+uint32_t d2_trace_count(void) {
+  return d2_trace_index < D2_TRACE_CAPACITY ? d2_trace_index : D2_TRACE_CAPACITY;
+}
 
 __attribute__((export_name("d2_trace_pc")))
-uint32_t d2_get_trace_pc(uint32_t back) { return d2_trace_pc[(d2_trace_index - 1u - back) & 1023u]; }
+uint32_t d2_get_trace_pc(uint32_t back) {
+  return d2_trace_pc[(d2_trace_index - 1u - back) & D2_TRACE_MASK];
+}
 
 __attribute__((export_name("d2_trace_esp")))
-uint32_t d2_get_trace_esp(uint32_t back) { return d2_trace_esp[(d2_trace_index - 1u - back) & 1023u]; }
+uint32_t d2_get_trace_esp(uint32_t back) {
+  return d2_trace_esp[(d2_trace_index - 1u - back) & D2_TRACE_MASK];
+}
 
 __attribute__((export_name("d2_set_fs_base")))
 void d2_set_fs_base(uint32_t value) { fs_base = value; }

@@ -22,8 +22,20 @@ the deterministic title-menu-to-gameplay replay directly:
 ```
 
 The runner writes the final 800x600 software framebuffer to
-`build/diablo-gameplay.ppm`. It is a Node.js host today; it does not invoke
-Wine or BoxedWine, and it is not yet packaged as a Chrome application.
+`build/diablo-gameplay.ppm`. That deterministic replay uses the Node.js host;
+the native egui host below provides a visible, interactive window. Neither
+host invokes Wine or BoxedWine.
+
+To run the same translated artifact in a visible native window:
+
+```sh
+./run-gameplay-egui.sh
+```
+
+The first launch compiles the large linked WASM module with Wasmtime and can
+take a minute or two. Mouse and keyboard events over the scaled game surface
+are forwarded to Diablo as Win32 messages. The runner has no round or time
+limit; status 1 is a resumable fuel boundary and execution continues.
 
 ## Clean build from the shareware demo
 
@@ -135,6 +147,99 @@ was reached and the machine is resumable; it is not a crash.
 
 Override the replay inputs or output path with `D2_AUTO_CLICKS`, `D2_AUTO_TEXT`,
 `D2_MAIN_ROUNDS`, and `D2_FRAMEBUFFER_PPM`.
+
+## Native egui host
+
+The Rust host in `native-egui` replaces Node with Wasmtime, eframe/egui, and a
+native Win32 compatibility boundary. It maps the linked PE images, runs the
+cooperative translated thread contexts, presents the 800x600 GDI framebuffer,
+and forwards pointer, mouse-button, text, and keyboard input.
+
+`run-gameplay-egui.sh` forwards runner options directly:
+
+```sh
+./run-gameplay-egui.sh \
+  --wasm build/diablo-linked-gameplay/linked.wasm \
+  --manifest build/diablo-link-compact.json \
+  --source-dir ../extracted \
+  --host-root build/runtime-files/diablo2
+```
+
+Cargo and Wasmtime build artifacts are large. Set `CARGO_TARGET_DIR` to a
+filesystem with several GiB free when necessary. An optional trusted Wasmtime
+module cache avoids the cold compile on later launches:
+
+```sh
+CARGO_TARGET_DIR=/dev/shm/d2-egui-target \
+D2_EGUI_MODULE_CACHE=/dev/shm/d2-linked.cwasm \
+./run-gameplay-egui.sh
+```
+
+For deterministic UI diagnostics, `D2_AUTO_CLICKS` uses the same
+`x,y,presentation` schedule syntax as the Node replay.
+
+### Record and replay native gameplay
+
+Record mouse, keyboard, and window-close input together with a verification
+checkpoint for every presented framebuffer:
+
+```sh
+./run-gameplay-egui.sh --record build/replays/barbarian.jsonl
+```
+
+Replay the exact input stream at the original presentation boundaries:
+
+```sh
+./run-gameplay-egui.sh --replay build/replays/barbarian.jsonl
+```
+
+The journal is line-delimited JSON. Its header fingerprints the linked Wasm,
+link manifest, mapped PE source images, and MPQ/LNG game data. Input records
+contain the presentation number and a strict sequence number; frame records
+contain the virtual Win32 clock and an FNV-1a checksum of the 800x600 RGBA
+framebuffer. Replay stops with the first divergent presentation instead of
+silently continuing with different state.
+
+Recording also creates `barbarian.jsonl.state`, a snapshot of the initial
+`Save` directory. Replay runs from a private temporary copy of that snapshot,
+so it neither depends on nor modifies the live character saves. Live gameplay
+input is ignored during replay except for closing the window.
+
+## SQLite lifted-code debug database
+
+`link-translate` can materialize the complete discovered program graph without
+regenerating or compiling the large Wasm artifact:
+
+```sh
+./d2wasm.py link-translate ../extracted \
+  --link-manifest build/diablo-link-compact.json \
+  --output-dir build/diablo-linked-gameplay \
+  --max-blocks-per-module 200000 \
+  --relocation-roots \
+  --roots-file diablo-roots.json \
+  --debug-db build/diablo-debug.sqlite \
+  --debug-db-only
+```
+
+The SQLite sidecar contains modules, sections, roots, blocks, every lifted
+instruction, CFG/call edges, resolved code and data xrefs, imports, exports,
+and extracted ASCII/UTF-16 strings. Indexed `call_xrefs` and `string_xrefs`
+views make common debugging queries short. For example:
+
+```sql
+SELECT source_module, printf('0x%08x', source_va),
+       printf('0x%08x', target_va), value
+FROM string_xrefs
+WHERE value = 'top >= 0';
+
+SELECT printf('0x%08x', source_instruction_va), kind,
+       printf('0x%08x', target_block_va)
+FROM edges
+WHERE target_block_va = 0x010651a0;
+```
+
+On the verified full build the database contains 16 modules, 223,392 blocks,
+912,528 instruction rows, 355,518 CFG edges, and 237,106 xrefs.
 
 ## Other commands
 

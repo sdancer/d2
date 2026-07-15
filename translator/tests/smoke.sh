@@ -60,7 +60,8 @@ const fs = require("node:fs");
 })().catch((error) => { console.error(error); process.exit(1); });
 JS
 
-llvm-dlltool-20 -m i386 -d "$here/smoke-api.def" -l "$build/test.lib"
+llvm_dlltool="${LLVM_DLLTOOL:-$(command -v llvm-dlltool-20 || command -v llvm-dlltool)}"
+"$llvm_dlltool" -m i386 -d "$here/smoke-api.def" -l "$build/test.lib"
 clang --target=i686-pc-windows-msvc -c "$here/smoke-api.s" -o "$build/smoke-api.obj"
 lld-link /entry:entry /subsystem:console /machine:x86 /nodefaultlib /fixed /safeseh:no \
   "/out:$build/smoke-api.exe" "$build/smoke-api.obj" "$build/test.lib"
