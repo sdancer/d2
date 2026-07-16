@@ -813,7 +813,11 @@ class CGenerator:
                 if spec.no_return:
                     lines += ["  d2_status = D2_STATUS_OK;", "  return D2_ACTION_RETURN;"]
                 else:
-                    lines += [f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;", "  D2_CHAIN();"]
+                    lines += [
+                        f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;",
+                        "  D2_YIELD_CHAIN();",
+                        "  D2_CHAIN();",
+                    ]
         elif block.terminator == "import_jump":
             assert block.imported_call is not None
             key = block.imported_call.display_name
@@ -857,6 +861,7 @@ class CGenerator:
                     "  d2_next_pc = load32(esp);",
                     f"  esp += {4 + cleanup}u;",
                     "  if (d2_next_pc == D2_RETURN_SENTINEL) { d2_status = D2_STATUS_OK; return D2_ACTION_RETURN; }",
+                    "  D2_YIELD_CHAIN();",
                     "  D2_CHAIN();",
                 ]
         elif block.terminator in ("indirect_call", "indirect_jump"):
@@ -909,9 +914,12 @@ def _render_c(pages: dict[int, list[str]], used_apis: dict[str, ApiSpec]) -> str
         case_text = "\n".join("    " + line for line in cases)
         shards.append(
             "#define D2_CHAIN() do { "
-            f"if (d2_yield_requested || !*block_fuel || (d2_next_pc >> 12) != 0x{page:05x}u) "
+            f"if (!*block_fuel || (d2_next_pc >> 12) != 0x{page:05x}u) "
             "return D2_ACTION_CONTINUE; "
             "pc = d2_next_pc; goto d2_page_dispatch; } while (0)\n"
+            "#define D2_YIELD_CHAIN() do { "
+            "if (d2_yield_requested) return D2_ACTION_CONTINUE; "
+            "} while (0)\n"
             "__attribute__((noinline))\n"
             f"static uint32_t d2_page_{page:05x}(uint32_t pc, uint32_t *block_fuel) {{\n"
             "  uint32_t a = 0, b = 0, result = 0, old_cf = 0;\n"
@@ -924,10 +932,11 @@ def _render_c(pages: dict[int, list[str]], used_apis: dict[str, ApiSpec]) -> str
             "    default: d2_status = D2_STATUS_MISSING_BLOCK; return D2_ACTION_RETURN;\n"
             "  }\n"
             "}\n"
+            "#undef D2_YIELD_CHAIN\n"
             "#undef D2_CHAIN\n"
         )
         page_dispatch.append(
-            f"    case 0x{page:05x}u: return d2_page_{page:05x}(pc, block_fuel);"
+            f"      case 0x{page:05x}u: action = d2_page_{page:05x}(pc, block_fuel); break;"
         )
     imports = []
     host_thunk_dispatch = []
@@ -1004,7 +1013,7 @@ static double fpu[8];
 static uint32_t fpu_depth;
 static uint16_t fpu_status;
 static uint16_t fpu_control;
-static uint32_t d2_yield_requested;
+static volatile uint32_t d2_yield_requested;
 
 typedef struct {
   uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp, fs_base;
@@ -1231,15 +1240,22 @@ static inline uint32_t rotate_value(uint32_t value, uint32_t count, uint32_t bit
 
 __attribute__((noinline))
 static uint32_t d2_dispatch_block(uint32_t pc, uint32_t *block_fuel) {
-  if (pc >= 0x@HOST_THUNK_BASE@u) {
-    D2_BEGIN_BLOCK(pc, block_fuel);
+  for (;;) {
+    if (pc >= 0x@HOST_THUNK_BASE@u) {
+      D2_BEGIN_BLOCK(pc, block_fuel);
 @HOST_THUNK_DISPATCH@
-    d2_status = D2_STATUS_MISSING_BLOCK;
-    return D2_ACTION_RETURN;
-  }
-  switch (pc >> 12) {
+      d2_status = D2_STATUS_MISSING_BLOCK;
+      return D2_ACTION_RETURN;
+    }
+    uint32_t action;
+    switch (pc >> 12) {
 @PAGE_DISPATCH@
-    default: d2_status = D2_STATUS_MISSING_BLOCK; return D2_ACTION_RETURN;
+      default: d2_status = D2_STATUS_MISSING_BLOCK; return D2_ACTION_RETURN;
+    }
+    if (action == D2_ACTION_RETURN || d2_yield_requested || !*block_fuel) {
+      return action;
+    }
+    pc = d2_next_pc;
   }
 }
 

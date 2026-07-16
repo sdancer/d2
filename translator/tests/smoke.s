@@ -21,6 +21,10 @@ _entry:
         jne _failed
         movl $42, %eax
         retl
+
+        # Put the callee on another lifted dispatch page so the smoke test
+        # covers page-to-page chaining as well as same-page branches.
+        .p2align 12
 _plus_two:
         addl $2, %eax
         retl

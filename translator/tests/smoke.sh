@@ -31,7 +31,28 @@ const path = process.argv[2];
   if (result !== 42 || status !== 0) {
     throw new Error(`translated PE returned ${result}, status ${status}`);
   }
-  console.log(`translated PE returned ${result}, status ${status}`);
+
+  const context = 0x80000;
+  new Uint8Array(instance.exports.memory.buffer, context, 256).fill(0);
+  let resumedResult = 0;
+  let rounds = 0;
+  while (!instance.exports.d2_context_finished(context) && rounds < 100) {
+    resumedResult = instance.exports.d2_run_context(context, 0x1000, 0x100000, 1);
+    const resumedStatus = instance.exports.d2_context_status(context);
+    if (!instance.exports.d2_context_finished(context) && resumedStatus !== 1) {
+      throw new Error(`resumed run stopped early with status ${resumedStatus}`);
+    }
+    rounds++;
+  }
+  const resumedStatus = instance.exports.d2_context_status(context);
+  if (resumedResult !== 42 || resumedStatus !== 0 || rounds < 2 || rounds >= 100) {
+    throw new Error(
+      `resumed translated PE returned ${resumedResult}, status ${resumedStatus}, rounds ${rounds}`,
+    );
+  }
+  console.log(
+    `translated PE returned ${result}, status ${status}; resumed in ${rounds} one-block rounds`,
+  );
 })().catch((error) => { console.error(error); process.exit(1); });
 JS
 
@@ -80,23 +101,36 @@ node - "$build/lifted-api/lifted.wasm" <<'JS'
 const fs = require("node:fs");
 const path = process.argv[2];
 let memory;
+let instance;
+let hostCalls = 0;
 const imports = {
   "win32.test.dll": {
     HostAdd(stackPointer) {
       const view = new DataView(memory.buffer);
+      hostCalls++;
+      if (hostCalls === 2) instance.exports.d2_request_yield();
       return view.getUint32(stackPointer, true) + view.getUint32(stackPointer + 4, true);
     },
   },
 };
 (async () => {
-  const { instance } = await WebAssembly.instantiate(fs.readFileSync(path), imports);
+  ({ instance } = await WebAssembly.instantiate(fs.readFileSync(path), imports));
   memory = instance.exports.memory;
-  const result = instance.exports.d2_run(0x1000, 0x100000, 100);
-  const status = instance.exports.d2_last_status();
-  if (result !== 42 || status !== 0) {
-    throw new Error(`translated PE/API returned ${result}, status ${status}`);
+  const context = 0x80000;
+  new Uint8Array(memory.buffer, context, 256).fill(0);
+  let result = instance.exports.d2_run_context(context, 0x1000, 0x100000, 100);
+  let status = instance.exports.d2_context_status(context);
+  if (status !== 5 || instance.exports.d2_context_finished(context) !== 0 || hostCalls !== 2) {
+    throw new Error(
+      `translated PE/API did not yield: result ${result}, status ${status}, calls ${hostCalls}`,
+    );
   }
-  console.log(`translated PE/API returned ${result}, status ${status}`);
+  result = instance.exports.d2_run_context(context, 0x1000, 0x100000, 100);
+  status = instance.exports.d2_context_status(context);
+  if (result !== 42 || status !== 0 || instance.exports.d2_context_finished(context) !== 1) {
+    throw new Error(`resumed PE/API returned ${result}, status ${status}`);
+  }
+  console.log(`translated PE/API yielded and resumed with ${result}, status ${status}`);
 })().catch((error) => { console.error(error); process.exit(1); });
 JS
 
