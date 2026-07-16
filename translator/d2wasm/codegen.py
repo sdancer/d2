@@ -1449,13 +1449,12 @@ def compile_wasm(
     optimization_flags = []
     if opt_level != "0":
         # Lifted x86 depends on wrapping arithmetic and type-punned guest
-        # memory. Keep page dispatch functions separate so large linked builds
-        # remain acceptable to Wasm engines while still allowing local
-        # optimization.
+        # memory. Page dispatch functions carry explicit noinline attributes;
+        # leave ordinary inlining enabled so tiny load/store and flag helpers
+        # do not become a function call for every lifted x86 instruction.
         optimization_flags = [
             "-fwrapv",
             "-fno-strict-aliasing",
-            "-fno-inline-functions",
             "-fno-vectorize",
             "-fno-slp-vectorize",
         ]
