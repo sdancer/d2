@@ -67,7 +67,7 @@ lld-link /entry:entry /subsystem:console /machine:x86 /nodefaultlib /fixed /safe
   "/out:$build/smoke-api.exe" "$build/smoke-api.obj" "$build/test.lib"
 
 "$root/d2wasm.py" translate "$build/smoke-api.exe" \
-  --api-spec "$here/smoke-api.json" --output-dir "$build/lifted-api"
+  --api-spec "$here/smoke-api.json" --opt-level 1 --output-dir "$build/lifted-api"
 
 node - "$build/lifted-api/lifted.wasm" <<'JS'
 const fs = require("node:fs");

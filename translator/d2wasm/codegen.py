@@ -925,6 +925,7 @@ static const char d2_dsound_description[] = "D2Wasm DirectSound";
 static const char d2_dsound_module[] = "dsound.dll";
 enum { D2_TRACE_CAPACITY = 16384u, D2_TRACE_MASK = D2_TRACE_CAPACITY - 1u };
 static uint32_t d2_trace_pc[D2_TRACE_CAPACITY], d2_trace_esp[D2_TRACE_CAPACITY], d2_trace_index;
+static uint32_t d2_diagnostics_enabled;
 static uint32_t d2_watch_pc, d2_watch_hit, d2_watch_registers[8], d2_stop_on_watch, d2_watch_skip;
 static uint32_t d2_count_pc, d2_count_hits;
 static uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp, fs_base;
@@ -1157,19 +1158,21 @@ static uint32_t d2_execute(uint32_t block_fuel) {
   while (block_fuel--) {
     d2_previous_pc = d2_last_pc;
     d2_last_pc = d2_next_pc;
-    d2_trace_pc[d2_trace_index & D2_TRACE_MASK] = d2_next_pc;
-    d2_trace_esp[d2_trace_index & D2_TRACE_MASK] = esp;
-    d2_trace_index++;
-    if (d2_next_pc == d2_count_pc) d2_count_hits++;
-    if (!d2_watch_hit && d2_next_pc == d2_watch_pc) {
-      if (d2_watch_skip) { d2_watch_skip--; }
-      else {
-      d2_watch_hit = 1;
-      d2_watch_registers[0] = eax; d2_watch_registers[1] = ebx;
-      d2_watch_registers[2] = ecx; d2_watch_registers[3] = edx;
-      d2_watch_registers[4] = esi; d2_watch_registers[5] = edi;
-      d2_watch_registers[6] = ebp; d2_watch_registers[7] = esp;
-      if (d2_stop_on_watch) { d2_status = D2_STATUS_YIELDED; return eax; }
+    if (__builtin_expect(d2_diagnostics_enabled, 0)) {
+      d2_trace_pc[d2_trace_index & D2_TRACE_MASK] = d2_next_pc;
+      d2_trace_esp[d2_trace_index & D2_TRACE_MASK] = esp;
+      d2_trace_index++;
+      if (d2_next_pc == d2_count_pc) d2_count_hits++;
+      if (!d2_watch_hit && d2_next_pc == d2_watch_pc) {
+        if (d2_watch_skip) { d2_watch_skip--; }
+        else {
+        d2_watch_hit = 1;
+        d2_watch_registers[0] = eax; d2_watch_registers[1] = ebx;
+        d2_watch_registers[2] = ecx; d2_watch_registers[3] = edx;
+        d2_watch_registers[4] = esi; d2_watch_registers[5] = edi;
+        d2_watch_registers[6] = ebp; d2_watch_registers[7] = esp;
+        if (d2_stop_on_watch) { d2_status = D2_STATUS_YIELDED; return eax; }
+        }
       }
     }
     if (d2_dispatch_block(d2_next_pc) == D2_ACTION_RETURN) return eax;
@@ -1321,7 +1324,10 @@ __attribute__((export_name("d2_set_fs_base")))
 void d2_set_fs_base(uint32_t value) { fs_base = value; }
 
 __attribute__((export_name("d2_set_watch_pc")))
-void d2_set_watch_pc(uint32_t value) { d2_watch_pc = value; }
+void d2_set_watch_pc(uint32_t value) {
+  d2_watch_pc = value;
+  if (value) d2_diagnostics_enabled = 1;
+}
 
 __attribute__((export_name("d2_set_stop_on_watch")))
 void d2_set_stop_on_watch(uint32_t value) { d2_stop_on_watch = value; }
@@ -1330,7 +1336,13 @@ __attribute__((export_name("d2_set_watch_skip")))
 void d2_set_watch_skip(uint32_t value) { d2_watch_skip = value; }
 
 __attribute__((export_name("d2_set_count_pc")))
-void d2_set_count_pc(uint32_t value) { d2_count_pc = value; d2_count_hits = 0; }
+void d2_set_count_pc(uint32_t value) {
+  d2_count_pc = value; d2_count_hits = 0;
+  if (value) d2_diagnostics_enabled = 1;
+}
+
+__attribute__((export_name("d2_set_diagnostics")))
+void d2_set_diagnostics(uint32_t value) { d2_diagnostics_enabled = value != 0; }
 
 __attribute__((export_name("d2_count_hits")))
 uint32_t d2_get_count_hits(void) { return d2_count_hits; }
@@ -1349,10 +1361,24 @@ def compile_wasm(
     initial_memory: int = 16 * 1024 * 1024,
     opt_level: str = "0",
 ) -> None:
+    optimization_flags = []
+    if opt_level != "0":
+        # Lifted x86 depends on wrapping arithmetic and type-punned guest
+        # memory. Keep page dispatch functions separate so large linked builds
+        # remain acceptable to Wasm engines while still allowing local
+        # optimization.
+        optimization_flags = [
+            "-fwrapv",
+            "-fno-strict-aliasing",
+            "-fno-inline-functions",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ]
     command = [
         "clang",
         "--target=wasm32-unknown-unknown",
         f"-O{opt_level}",
+        *optimization_flags,
         "-nostdlib",
         "-Wl,--no-entry",
         "-Wl,--export-memory",
