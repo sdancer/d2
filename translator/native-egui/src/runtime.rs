@@ -422,7 +422,11 @@ impl Runtime {
     }
 
     fn advance_clock(&mut self, delta: u32) -> u32 {
-        self.clock_offset = self.clock_now().wrapping_add(delta);
+        let now = self.clock_now();
+        if delta == 0 {
+            return now;
+        }
+        self.clock_offset = now.wrapping_add(delta);
         self.clock_origin = Instant::now();
         self.virtual_time = self.clock_offset;
         self.virtual_time
