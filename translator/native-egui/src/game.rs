@@ -396,24 +396,49 @@ fn capture_retained_trace_profile(
     const TRACE_CAPACITY: u32 = 16_384;
     let trace_pc = wt(instance.get_typed_func::<u32, u32>(&mut *store, "d2_trace_pc"))?;
     let mut counts = HashMap::<u32, u32>::new();
+    let mut pcs = Vec::with_capacity(TRACE_CAPACITY as usize);
     for back in 0..TRACE_CAPACITY {
         let pc = wt(trace_pc.call(&mut *store, back))?;
         if pc != 0 {
             *counts.entry(pc).or_default() += 1;
+            pcs.push(pc);
         }
     }
+    let transitions = pcs.len().saturating_sub(1);
+    let page_crossings = |shift: u32| {
+        pcs.windows(2)
+            .filter(|pair| (pair[0] >> shift) != (pair[1] >> shift))
+            .count()
+    };
+    let crossings_4k = page_crossings(12);
+    let crossings_16k = page_crossings(14);
     let mut counts = counts.into_iter().collect::<Vec<_>>();
     counts.sort_unstable_by(|(left_pc, left_count), (right_pc, right_count)| {
         right_count
             .cmp(left_count)
             .then_with(|| left_pc.cmp(right_pc))
     });
-    Ok(counts
+    let hot_pcs = counts
         .into_iter()
         .take(16)
         .map(|(pc, count)| format!("{pc:#010x}={count}"))
         .collect::<Vec<_>>()
-        .join(", "))
+        .join(", ");
+    Ok(format!(
+        "samples={}, 4k_crossings={crossings_4k}/{transitions} ({:.1}%), \
+         16k_crossings={crossings_16k}/{transitions} ({:.1}%), hot=[{hot_pcs}]",
+        pcs.len(),
+        percentage(crossings_4k, transitions),
+        percentage(crossings_16k, transitions),
+    ))
+}
+
+fn percentage(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 * 100.0 / denominator as f64
+    }
 }
 
 fn capture_stopped_context_trace(
