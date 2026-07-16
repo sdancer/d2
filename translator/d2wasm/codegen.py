@@ -25,6 +25,15 @@ CONTROL_TERMINATORS = {
     "jump_table",
 }
 
+HOST_THUNK_BASE = 0xE0000000
+
+
+def host_thunk_pc(key: str) -> int:
+    value = 0x811C9DC5
+    for byte in key.lower().encode("utf-8"):
+        value = ((value ^ byte) * 0x01000193) & 0xFFFFFFFF
+    return HOST_THUNK_BASE | (value & 0x0FFFFFFC)
+
 
 @dataclass(frozen=True)
 class UnsupportedSite:
@@ -77,7 +86,12 @@ class CGenerator:
         return pc & 0xFFFFFFFF
 
     def _dynamic_pc(self, expression: str) -> str:
-        return expression if self.global_pc else f"({expression}) - 0x{self.load_base:08x}u"
+        if self.global_pc:
+            return expression
+        return (
+            f"(({expression}) >= 0x{HOST_THUNK_BASE:08x}u ? "
+            f"({expression}) : ({expression}) - 0x{self.load_base:08x}u)"
+        )
 
     def _fail(self, instruction: Any, reason: str) -> None:
         self.unsupported.append(
@@ -146,6 +160,22 @@ class CGenerator:
             expression = base if reg_bits == 32 else f"(({base} >> {shift}) & 0x{_mask(reg_bits):x}u)"
             return expression, reg_bits
         if operand.type == X86_OP_MEM:
+            memory = operand.mem
+            if bits == 32 and not memory.base and not memory.index and not memory.segment:
+                symbol = self.image.import_by_iat_va.get(int(memory.disp) & 0xFFFFFFFF)
+                if symbol is not None:
+                    key = symbol.display_name
+                    internal_target = self.internal_targets.get(key)
+                    if internal_target is not None:
+                        return f"0x{internal_target:08x}u", bits
+                    spec = self.api_specs.get(key)
+                    if (
+                        spec is not None
+                        and self._intrinsic_import(key) is None
+                        and key.lower() != "dsound.dll!#2"
+                    ):
+                        self.used_apis[key] = spec
+                        return f"0x{host_thunk_pc(spec.key):08x}u", bits
             address = self._address(instruction, operand)
             if address is None:
                 return None
@@ -891,14 +921,44 @@ def _render_c(pages: dict[int, list[str]], used_apis: dict[str, ApiSpec]) -> str
         )
         page_dispatch.append(f"    case 0x{page:05x}u: return d2_page_{page:05x}(pc);")
     imports = []
+    host_thunk_dispatch = []
+    thunk_keys: dict[int, str] = {}
     for spec in sorted(used_apis.values(), key=lambda value: value.key):
         function = "api_" + safe_module_name(spec.library + "_" + spec.name).replace(".", "_").replace("-", "_")
         imports.append(
             f'__attribute__((import_module("win32.{spec.library.lower()}"), import_name("{spec.name}"))) '
             f'extern uint32_t {function}(uint32_t);'
         )
+        thunk_pc = host_thunk_pc(spec.key)
+        collision = thunk_keys.get(thunk_pc)
+        if collision is not None and collision != spec.key:
+            raise ValueError(
+                f"host thunk collision at 0x{thunk_pc:08x}: {collision} and {spec.key}"
+            )
+        thunk_keys[thunk_pc] = spec.key
+        cleanup = spec.arg_bytes if spec.convention == "stdcall" else 0
+        lines = [
+            f"  if (pc == 0x{thunk_pc:08x}u) {{",
+            "    uint32_t return_pc = load32(esp);",
+            f"    eax = {function}(esp + 4u);",
+        ]
+        if spec.no_return:
+            lines += [
+                "    d2_status = D2_STATUS_OK;",
+                "    return D2_ACTION_RETURN;",
+            ]
+        else:
+            lines += [
+                f"    esp += {4 + cleanup}u;",
+                "    d2_next_pc = return_pc;",
+                "    if (return_pc == D2_RETURN_SENTINEL) { d2_status = D2_STATUS_OK; return D2_ACTION_RETURN; }",
+                "    return D2_ACTION_CONTINUE;",
+            ]
+        lines.append("  }")
+        host_thunk_dispatch.extend(lines)
     return (
         C_TEMPLATE.replace("@IMPORTS@", "\n".join(imports))
+        .replace("@HOST_THUNK_DISPATCH@", "\n".join(host_thunk_dispatch))
         .replace("@SHARDS@", "\n".join(shards))
         .replace("@PAGE_DISPATCH@", "\n".join(page_dispatch))
     )
@@ -1133,6 +1193,7 @@ static inline uint32_t rotate_value(uint32_t value, uint32_t count, uint32_t bit
 
 __attribute__((noinline))
 static uint32_t d2_dispatch_block(uint32_t pc) {
+@HOST_THUNK_DISPATCH@
   switch (pc >> 12) {
 @PAGE_DISPATCH@
     default: d2_status = D2_STATUS_MISSING_BLOCK; return D2_ACTION_RETURN;
