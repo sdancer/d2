@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::mpsc::{Receiver, SyncSender},
@@ -123,7 +123,11 @@ pub fn run(
     let set_fs_base = wt(instance.get_typed_func::<u32, ()>(&mut store, "d2_set_fs_base"))?;
     wt(set_fs_base.call(&mut store, FS_BASE))?;
     let stop_trace_limit = environment_u32("D2_STOP_TRACE")?.filter(|limit| *limit != 0);
-    if environment_u32("D2_DIAGNOSTICS")?.unwrap_or(0) != 0 || stop_trace_limit.is_some() {
+    let profile_trace = environment_u32("D2_PROFILE_TRACE")?.unwrap_or(0) != 0;
+    if environment_u32("D2_DIAGNOSTICS")?.unwrap_or(0) != 0
+        || stop_trace_limit.is_some()
+        || profile_trace
+    {
         let set_diagnostics =
             wt(instance.get_typed_func::<u32, ()>(&mut store, "d2_set_diagnostics"))?;
         wt(set_diagnostics.call(&mut store, 1))?;
@@ -215,6 +219,16 @@ pub fn run(
     let fps_interval = environment_u32("D2_FPS_LOG_MS")?
         .filter(|milliseconds| *milliseconds != 0)
         .map(|milliseconds| Duration::from_millis(u64::from(milliseconds)));
+    let fps_memory = std::env::var("D2_FPS_MEMORY")
+        .ok()
+        .into_iter()
+        .flat_map(|addresses| {
+            addresses
+                .split(',')
+                .filter_map(|address| parse_u32(address.trim()).ok())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let mut fps_sample_started = Instant::now();
     let (mut fps_sample_presentations, mut fps_sample_virtual_ms) =
         store.data().runtime.timing_counters();
@@ -261,14 +275,30 @@ pub fn run(
             let virtual_delta = virtual_ms.wrapping_sub(fps_sample_virtual_ms);
             let round_delta = rounds - fps_sample_round;
             let thread_contexts = store.data().runtime.thread_contexts();
-            let (next_pc, last_pc, thread_state) = {
+            let (next_pc, last_pc, thread_state, memory_state) = {
                 let bytes = memory.data(&store);
                 let thread_state = thread_contexts
                     .iter()
                     .map(|(handle, thread_context)| {
+                        let thread_context = *thread_context;
+                        let initialized = read_u32(bytes, thread_context).unwrap_or(0);
+                        let finished = read_u32(bytes, thread_context + 4).unwrap_or(0);
+                        let status = read_u32(bytes, thread_context + 8).unwrap_or(0);
                         let next = read_u32(bytes, thread_context + 12).unwrap_or(0);
-                        let status = read_u32(bytes, thread_context + 24).unwrap_or(0);
-                        format!("{handle:#x}:{next:#010x}/s{status}")
+                        let last = read_u32(bytes, thread_context + 16).unwrap_or(0);
+                        format!(
+                            "{handle:#x}:i{initialized}/f{finished}/s{status}/{next:#010x}/{last:#010x}"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let memory_state = fps_memory
+                    .iter()
+                    .map(|address| {
+                        format!(
+                            "{address:#010x}={:#010x}",
+                            read_u32(bytes, *address).unwrap_or(0)
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(",");
@@ -276,19 +306,29 @@ pub fn run(
                     read_u32(bytes, context + 12).unwrap_or(0),
                     read_u32(bytes, context + 16).unwrap_or(0),
                     thread_state,
+                    memory_state,
                 )
             };
             let report = format!(
                 "FPS sample: wall={elapsed:.3}s, presentations={presentation_delta}, \
                  fps={:.2}, rounds={round_delta}, rounds_per_second={:.2}, \
                  virtual_ms={virtual_delta}, clock_rate={:.2}x, \
-                 main={next_pc:#010x}/{last_pc:#010x}, threads=[{thread_state}]",
+                 main={next_pc:#010x}/{last_pc:#010x}, threads=[{thread_state}], \
+                 memory=[{memory_state}]",
                 presentation_delta as f64 / elapsed,
                 round_delta as f64 / elapsed,
                 f64::from(virtual_delta) / (elapsed * 1_000.0),
             );
             eprintln!("{report}");
             send(&event_tx, HostEvent::Log(report));
+            if profile_trace {
+                let profile = capture_retained_trace_profile(&instance, &mut store)?;
+                eprintln!("Retained translated trace profile: {profile}");
+                send(
+                    &event_tx,
+                    HostEvent::Log(format!("Retained translated trace profile: {profile}")),
+                );
+            }
             fps_sample_started = Instant::now();
             fps_sample_presentations = presentations;
             fps_sample_virtual_ms = virtual_ms;
@@ -349,6 +389,33 @@ pub fn run(
     Ok(())
 }
 
+fn capture_retained_trace_profile(
+    instance: &Instance,
+    store: &mut Store<HostState>,
+) -> Result<String> {
+    const TRACE_CAPACITY: u32 = 16_384;
+    let trace_pc = wt(instance.get_typed_func::<u32, u32>(&mut *store, "d2_trace_pc"))?;
+    let mut counts = HashMap::<u32, u32>::new();
+    for back in 0..TRACE_CAPACITY {
+        let pc = wt(trace_pc.call(&mut *store, back))?;
+        if pc != 0 {
+            *counts.entry(pc).or_default() += 1;
+        }
+    }
+    let mut counts = counts.into_iter().collect::<Vec<_>>();
+    counts.sort_unstable_by(|(left_pc, left_count), (right_pc, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_pc.cmp(right_pc))
+    });
+    Ok(counts
+        .into_iter()
+        .take(16)
+        .map(|(pc, count)| format!("{pc:#010x}={count}"))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
 fn capture_stopped_context_trace(
     instance: &Instance,
     store: &mut Store<HostState>,
@@ -397,17 +464,20 @@ fn environment_u32(name: &str) -> Result<Option<u32>> {
         return Ok(None);
     };
     let value = value.trim();
-    let parsed = if let Some(hex) = value
+    Ok(Some(parse_u32(value).with_context(|| {
+        format!("invalid {name} value {value:?}")
+    })?))
+}
+
+fn parse_u32(value: &str) -> Result<u32, std::num::ParseIntError> {
+    if let Some(hex) = value
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))
     {
         u32::from_str_radix(hex, 16)
     } else {
         value.parse()
-    };
-    Ok(Some(parsed.with_context(|| {
-        format!("invalid {name} value {value:?}")
-    })?))
+    }
 }
 
 fn context_watch_report(memory: &[u8], thread: u32, context: u32) -> Option<String> {

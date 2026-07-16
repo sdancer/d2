@@ -173,6 +173,9 @@ impl Runtime {
                     height: arg(memory, sp, 7) as i32,
                 });
                 self.active_window = handle;
+                for (message, w_param) in [(0x001c, 1), (0x0006, 1), (0x0007, 0)] {
+                    self.enqueue(message, w_param, 0);
+                }
                 let _ = self.event_tx.try_send(HostEvent::Status(format!(
                     "Created game window ({class_name}, HWND {handle:#x})"
                 )));
