@@ -67,27 +67,36 @@ lld-link /entry:entry /subsystem:console /machine:x86 /nodefaultlib /fixed /safe
   "/out:$build/smoke-api.exe" "$build/smoke-api.obj" "$build/test.lib"
 
 "$root/d2wasm.py" translate "$build/smoke-api.exe" \
-  --api-spec "$here/smoke-api.json" --output-dir "$build/lifted-api"
+  --api-spec "$here/smoke-api.json" --opt-level 1 --output-dir "$build/lifted-api"
 
 node - "$build/lifted-api/lifted.wasm" <<'JS'
 const fs = require("node:fs");
 const path = process.argv[2];
 let memory;
+let instance;
+let requestYield = false;
 const imports = {
   "win32.test.dll": {
     HostAdd(stackPointer) {
       const view = new DataView(memory.buffer);
+      if (requestYield) instance.exports.d2_request_yield();
       return view.getUint32(stackPointer, true) + view.getUint32(stackPointer + 4, true);
     },
   },
 };
 (async () => {
-  const { instance } = await WebAssembly.instantiate(fs.readFileSync(path), imports);
+  ({ instance } = await WebAssembly.instantiate(fs.readFileSync(path), imports));
   memory = instance.exports.memory;
   const result = instance.exports.d2_run(0x1000, 0x100000, 100);
   const status = instance.exports.d2_last_status();
   if (result !== 42 || status !== 0) {
     throw new Error(`translated PE/API returned ${result}, status ${status}`);
+  }
+  requestYield = true;
+  const yieldedResult = instance.exports.d2_run(0x1000, 0x100000, 100);
+  const yieldedStatus = instance.exports.d2_last_status();
+  if (yieldedResult !== 42 || yieldedStatus !== 5) {
+    throw new Error(`re-entrant host yield returned ${yieldedResult}, status ${yieldedStatus}`);
   }
   console.log(`translated PE/API returned ${result}, status ${status}`);
 })().catch((error) => { console.error(error); process.exit(1); });

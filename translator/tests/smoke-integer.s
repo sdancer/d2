@@ -196,6 +196,24 @@ _indirect_join:
         cmpl $0x13579bdf, %eax
         jne _failed
 
+        # Diablo's loading transition compares three adjacent 32-bit fields
+        # with REPE CMPSD before entering the world.
+        movl $121, %ebx
+        subl $24, %esp
+        movl $1, 0(%esp)
+        movl $2, 4(%esp)
+        movl $3, 8(%esp)
+        movl $1, 12(%esp)
+        movl $2, 16(%esp)
+        movl $3, 20(%esp)
+        leal 0(%esp), %esi
+        leal 12(%esp), %edi
+        movl $3, %ecx
+        cld
+        repe cmpsl
+        leal 24(%esp), %esp
+        jne _failed
+
         movl $42, %eax
         retl
 

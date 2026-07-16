@@ -37,6 +37,7 @@ mapLinkedImages(instance.exports.memory, manifest, (pe) =>
 const fsBase = 0x00700000;
 new DataView(instance.exports.memory.buffer).setUint32(fsBase, 0xffffffff, true);
 instance.exports.d2_set_fs_base(fsBase);
+if (process.env.D2_DIAGNOSTICS) instance.exports.d2_set_diagnostics?.(1);
 if (watchText && !process.env.D2_ARCHIVE_PROBE) {
   if (process.env.D2_WATCH_AFTER_PRESENTATION) {
     runtime.delayedWatchPc = Number.parseInt(watchText, 0) >>> 0;
@@ -184,6 +185,7 @@ if (!initializationFailure && !process.env.D2_DLL_INIT_ONLY && !process.env.D2_A
   let capturedWatch = null;
   while (rounds < maximumRounds && status === 1) {
     result = instance.exports.d2_run_context(context, translation.entry_va, stackTop, fuel);
+    runtime.runPendingThreads(Math.min(fuel, 50_000));
     status = instance.exports.d2_context_status(context) >>> 0;
     rounds++;
     if (instance.exports.d2_context_watch_hit(context)) {

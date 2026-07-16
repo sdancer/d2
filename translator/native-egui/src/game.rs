@@ -120,6 +120,16 @@ pub fn run(
 
     let set_fs_base = wt(instance.get_typed_func::<u32, ()>(&mut store, "d2_set_fs_base"))?;
     wt(set_fs_base.call(&mut store, FS_BASE))?;
+    let diagnostics = environment_u32("D2_DIAGNOSTICS")?.unwrap_or(0) != 0;
+    if diagnostics {
+        let set_diagnostics =
+            wt(instance.get_typed_func::<u32, ()>(&mut store, "d2_set_diagnostics"))?;
+        wt(set_diagnostics.call(&mut store, 1))?;
+        send(
+            &event_tx,
+            HostEvent::Log(String::from("Translated diagnostics enabled")),
+        );
+    }
     let run = wt(instance.get_typed_func::<(u32, u32, u32), u32>(&mut store, "d2_run"))?;
     let last_status = wt(instance.get_typed_func::<(), u32>(&mut store, "d2_last_status"))?;
 
@@ -232,6 +242,39 @@ pub fn run(
                     "Running — round {rounds}, result={result:#x}, status={status}"
                 )),
             );
+        }
+        if diagnostics && rounds % 100 == 0 {
+            let (next, last, esp) = {
+                let bytes = memory.data(&store);
+                (
+                    read_u32(bytes, context + 12).unwrap_or(0),
+                    read_u32(bytes, context + 16).unwrap_or(0),
+                    read_u32(bytes, context + 92).unwrap_or(0),
+                )
+            };
+            let (presentations, threads, sounds) = store.data().runtime.debug_counts();
+            let playing = store.data_mut().runtime.debug_sound_summary();
+            let thread_contexts = store.data().runtime.thread_contexts();
+            let thread_state = {
+                let bytes = memory.data(&store);
+                thread_contexts
+                    .into_iter()
+                    .map(|(handle, thread_context)| {
+                        let next = read_u32(bytes, thread_context + 12).unwrap_or(0);
+                        let last = read_u32(bytes, thread_context + 16).unwrap_or(0);
+                        let status = read_u32(bytes, thread_context + 24).unwrap_or(0);
+                        format!("{handle:#x}:{next:#010x}/{last:#010x}/s{status}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let report = format!(
+                "Debug checkpoint: round={rounds}, presentation={presentations}, result={result:#x}, \
+                 status={status}, next={next:#010x}, last={last:#010x}, esp={esp:#010x}, \
+                 threads={threads}[{thread_state}], sounds={sounds}, playing=[{playing}]"
+            );
+            eprintln!("{report}");
+            send(&event_tx, HostEvent::Log(report));
         }
         if store.data().runtime.quit_requested() {
             break;
@@ -476,6 +519,7 @@ fn register_imports(module: &Module, linker: &mut Linker<HostState>) -> Result<(
                         callback_result[0].unwrap_i32() as u32
                     }
                     DispatchResult::Wait(request) => run_wait(&mut caller, request)?,
+                    DispatchResult::Yield => run_yield(&mut caller)?,
                 };
                 results[0] = Val::I32(value as i32);
                 Ok(())
@@ -603,6 +647,31 @@ fn run_wait(
         )));
     }
     Ok(if request.timeout == 0 { 258 } else { 0 })
+}
+
+fn run_yield(caller: &mut Caller<'_, HostState>) -> Result<u32, WasmtimeError> {
+    if caller.data().runtime.is_running_thread() {
+        call_export_void(caller, "d2_request_yield")?;
+        return Ok(0);
+    }
+
+    let threads = caller.data().runtime.wait_threads(0);
+    for handle in threads {
+        let Some(run) = caller.data_mut().runtime.begin_thread_run(handle) else {
+            continue;
+        };
+        match run_thread(caller, &run) {
+            Ok((exit_code, status, finished)) => caller
+                .data_mut()
+                .runtime
+                .finish_thread_run(&run, exit_code, status, finished),
+            Err(error) => {
+                caller.data_mut().runtime.abort_thread_run(&run);
+                return Err(error);
+            }
+        }
+    }
+    Ok(0)
 }
 
 fn run_thread(

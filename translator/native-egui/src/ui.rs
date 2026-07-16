@@ -66,7 +66,14 @@ pub struct D2App {
 
 impl D2App {
     pub fn new(events: Receiver<HostEvent>, input: Sender<InputEvent>) -> Self {
-        let audio = AudioOutput::new();
+        let sound_disabled = std::env::var("D2_DISABLE_SOUND")
+            .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let audio = if sound_disabled {
+            Err(String::from("disabled by D2_DISABLE_SOUND"))
+        } else {
+            AudioOutput::new()
+        };
         let audio_error = audio.as_ref().err().cloned();
         let mut app = Self {
             events,

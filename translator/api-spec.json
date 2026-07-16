@@ -303,6 +303,42 @@
     ,{"library":"wsock32.dll","name":"#115","arg_bytes":8}
     ,{"library":"wsock32.dll","name":"#116","arg_bytes":0}
     ,{"library":"wsock32.dll","name":"#151","arg_bytes":8}
+    ,{"library":"glide3x.dll","name":"_grAlphaBlendFunction@16","arg_bytes":16}
+    ,{"library":"glide3x.dll","name":"_grAlphaCombine@20","arg_bytes":20}
+    ,{"library":"glide3x.dll","name":"_grBufferClear@12","arg_bytes":12}
+    ,{"library":"glide3x.dll","name":"_grBufferSwap@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grChromakeyMode@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grChromakeyValue@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grColorCombine@20","arg_bytes":20}
+    ,{"library":"glide3x.dll","name":"_grColorMask@8","arg_bytes":8}
+    ,{"library":"glide3x.dll","name":"_grConstantColorValue@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grCoordinateSpace@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grDepthMask@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grDitherMode@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grDrawLine@8","arg_bytes":8}
+    ,{"library":"glide3x.dll","name":"_grDrawPoint@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grDrawVertexArray@12","arg_bytes":12}
+    ,{"library":"glide3x.dll","name":"_grDrawVertexArrayContiguous@16","arg_bytes":16}
+    ,{"library":"glide3x.dll","name":"_grFinish@0","arg_bytes":0}
+    ,{"library":"glide3x.dll","name":"_grGet@12","arg_bytes":12}
+    ,{"library":"glide3x.dll","name":"_grGetString@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grGlideInit@0","arg_bytes":0}
+    ,{"library":"glide3x.dll","name":"_grGlideShutdown@0","arg_bytes":0}
+    ,{"library":"glide3x.dll","name":"_grLfbLock@24","arg_bytes":24}
+    ,{"library":"glide3x.dll","name":"_grLfbUnlock@8","arg_bytes":8}
+    ,{"library":"glide3x.dll","name":"_grLoadGammaTable@16","arg_bytes":16}
+    ,{"library":"glide3x.dll","name":"_grSstSelect@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grSstWinClose@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grSstWinOpen@28","arg_bytes":28}
+    ,{"library":"glide3x.dll","name":"_grTexCombine@28","arg_bytes":28}
+    ,{"library":"glide3x.dll","name":"_grTexDownloadMipMap@16","arg_bytes":16}
+    ,{"library":"glide3x.dll","name":"_grTexDownloadTable@8","arg_bytes":8}
+    ,{"library":"glide3x.dll","name":"_grTexFilterMode@12","arg_bytes":12}
+    ,{"library":"glide3x.dll","name":"_grTexMaxAddress@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grTexMinAddress@4","arg_bytes":4}
+    ,{"library":"glide3x.dll","name":"_grTexSource@16","arg_bytes":16}
+    ,{"library":"glide3x.dll","name":"_grVertexLayout@12","arg_bytes":12}
+    ,{"library":"glide3x.dll","name":"_guGammaCorrectionRGB@12","arg_bytes":12}
     ,{"library":"dsound.dll","name":"#1","arg_bytes":12}
   ]
 }

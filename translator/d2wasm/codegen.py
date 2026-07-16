@@ -25,6 +25,15 @@ CONTROL_TERMINATORS = {
     "jump_table",
 }
 
+HOST_THUNK_BASE = 0xE0000000
+
+
+def host_thunk_pc(key: str) -> int:
+    value = 0x811C9DC5
+    for byte in key.lower().encode("utf-8"):
+        value = ((value ^ byte) * 0x01000193) & 0xFFFFFFFF
+    return HOST_THUNK_BASE | (value & 0x0FFFFFFC)
+
 
 @dataclass(frozen=True)
 class UnsupportedSite:
@@ -77,7 +86,12 @@ class CGenerator:
         return pc & 0xFFFFFFFF
 
     def _dynamic_pc(self, expression: str) -> str:
-        return expression if self.global_pc else f"({expression}) - 0x{self.load_base:08x}u"
+        if self.global_pc:
+            return expression
+        return (
+            f"(({expression}) >= 0x{HOST_THUNK_BASE:08x}u ? "
+            f"({expression}) : ({expression}) - 0x{self.load_base:08x}u)"
+        )
 
     def _fail(self, instruction: Any, reason: str) -> None:
         self.unsupported.append(
@@ -146,6 +160,19 @@ class CGenerator:
             expression = base if reg_bits == 32 else f"(({base} >> {shift}) & 0x{_mask(reg_bits):x}u)"
             return expression, reg_bits
         if operand.type == X86_OP_MEM:
+            memory = operand.mem
+            if bits == 32 and not memory.base and not memory.index and not memory.segment:
+                symbol = self.image.import_by_iat_va.get(int(memory.disp) & 0xFFFFFFFF)
+                if symbol is not None:
+                    key = symbol.display_name
+                    internal_target = self.internal_targets.get(key)
+                    if internal_target is not None:
+                        return f"0x{internal_target:08x}u", bits
+                    spec = self.api_specs.get(key)
+                    if (spec is not None and self._intrinsic_import(key) is None
+                            and key.lower() != "dsound.dll!#2"):
+                        self.used_apis[key] = spec
+                        return f"0x{host_thunk_pc(spec.key):08x}u", bits
             address = self._address(instruction, operand)
             if address is None:
                 return None
@@ -497,9 +524,16 @@ class CGenerator:
         if mnemonic in ("repne scasb", "repe scasb", "repz scasb"):
             repeat_while = "!zf" if mnemonic.startswith("repne") else "zf"
             return [f"do {{ if (!ecx) break; a = eax & 0xffu; b = load8(edi); result = (a - b) & 0xffu; flags_sub32(a, b, result, 8u); edi += df ? -1 : 1; ecx--; }} while (ecx && {repeat_while});"]
-        if mnemonic in ("repe cmpsb", "repz cmpsb", "repne cmpsb"):
+        if mnemonic in (
+            "repe cmpsb", "repz cmpsb", "repne cmpsb",
+            "repe cmpsw", "repz cmpsw", "repne cmpsw",
+            "repe cmpsd", "repz cmpsd", "repne cmpsd",
+        ):
             repeat_while = "!zf" if mnemonic.startswith("repne") else "zf"
-            return [f"do {{ if (!ecx) break; a = load8(esi); b = load8(edi); result = (a - b) & 0xffu; flags_sub32(a, b, result, 8u); esi += df ? -1 : 1; edi += df ? -1 : 1; ecx--; }} while (ecx && {repeat_while});"]
+            bits = 32 if mnemonic.endswith("d") else 16 if mnemonic.endswith("w") else 8
+            stride = bits // 8
+            mask = "0xffffffffu" if bits == 32 else f"0x{(1 << bits) - 1:x}u"
+            return [f"do {{ if (!ecx) break; a = load{bits}(esi); b = load{bits}(edi); result = (a - b) & {mask}; flags_sub32(a, b, result, {bits}u); esi += df ? -{stride} : {stride}; edi += df ? -{stride} : {stride}; ecx--; }} while (ecx && {repeat_while});"]
         if mnemonic == "fld" and len(operands) == 1:
             value = self._fpu_value(instruction, operands[0])
             return [f"fpu_push({value});"] if value else None
@@ -511,6 +545,10 @@ class CGenerator:
             return ["fpu_push(3.14159265358979323846264338327950288);"]
         if mnemonic == "fldln2":
             return ["fpu_push(0.693147180559945309417232121458176568);"]
+        if mnemonic == "fldl2e":
+            return ["fpu_push(1.44269504088896340735992468100189214);"]
+        if mnemonic == "fldlg2":
+            return ["fpu_push(0.301029995663981195213738894724493027);"]
         if mnemonic == "fild" and len(operands) == 1 and operands[0].type == X86_OP_MEM:
             address = self._address(instruction, operands[0])
             bits = int(operands[0].size) * 8
@@ -523,22 +561,27 @@ class CGenerator:
             if store is None:
                 return None
             return [store, "fpu_pop();"] if mnemonic == "fstp" else [store]
-        if mnemonic in ("fist", "fistp") and len(operands) == 1 and operands[0].type == X86_OP_MEM:
+        if mnemonic in ("fist", "fistp", "fisttp") and len(operands) == 1 and operands[0].type == X86_OP_MEM:
             address = self._address(instruction, operands[0])
             bits = int(operands[0].size) * 8
             if address is None or bits not in (16, 32, 64):
                 self._fail(instruction, "fist requires a 16-, 32-, or 64-bit integer destination")
                 return None
-            lines = [f"store{bits}({address}, (uint{bits}_t)(int{bits}_t)fpu_round(fpu[0]));"]
-            if mnemonic == "fistp":
+            value = "__builtin_trunc(fpu[0])" if mnemonic == "fisttp" else "fpu_round(fpu[0])"
+            lines = [f"store{bits}({address}, (uint{bits}_t)(int{bits}_t){value});"]
+            if mnemonic in ("fistp", "fisttp"):
                 lines.append("fpu_pop();")
             return lines
         if mnemonic == "fchs":
             return ["fpu[0] = -fpu[0];"]
+        if mnemonic == "fabs":
+            return ["if (fpu[0] < 0.0) fpu[0] = -fpu[0];"]
         if mnemonic == "fsin":
             return ["fpu[0] = fpu_sin(fpu[0]);"]
         if mnemonic == "fcos":
             return ["fpu[0] = fpu_cos(fpu[0]);"]
+        if mnemonic == "fsqrt" and not operands:
+            return ["fpu[0] = __builtin_sqrt(fpu[0]);"]
         if mnemonic == "fxch" and len(operands) in (1, 2):
             value = self._fpu_value(instruction, operands[-1])
             if value is None or not value.startswith("fpu["):
@@ -547,6 +590,12 @@ class CGenerator:
             return [f"fpu_swap({value[4:-1]});"]
         if mnemonic == "frndint":
             return ["fpu[0] = fpu_round(fpu[0]);"]
+        if mnemonic == "fyl2x" and not operands:
+            return ["fpu[1] = fpu[1] * fpu_log2(fpu[0]);", "fpu_pop();"]
+        if mnemonic == "f2xm1" and not operands:
+            return ["fpu[0] = fpu_exp2_fraction(fpu[0]) - 1.0;"]
+        if mnemonic == "fscale" and not operands:
+            return ["fpu[0] *= fpu_integer_pow(2.0, __builtin_trunc(fpu[1]));"]
         if mnemonic in ("fadd", "fsub", "fsubr", "fmul", "fdiv", "fdivr") and len(operands) == 1:
             value = self._fpu_value(instruction, operands[0])
             if value is None:
@@ -595,7 +644,7 @@ class CGenerator:
                 "fidiv": f"fpu[0] / {value}", "fidivr": f"{value} / fpu[0]",
             }[mnemonic]
             return [f"fpu[0] = {expression};"]
-        if mnemonic in ("fcomp", "fcom") and len(operands) == 1:
+        if mnemonic in ("fcomp", "fcom", "fucom") and len(operands) == 1:
             value = self._fpu_value(instruction, operands[0])
             if value is None:
                 return None
@@ -603,6 +652,19 @@ class CGenerator:
             if mnemonic == "fcomp":
                 lines.append("fpu_pop();")
             return lines
+        if mnemonic in ("ficom", "ficomp") and len(operands) == 1 and operands[0].type == X86_OP_MEM:
+            address = self._address(instruction, operands[0])
+            bits = int(operands[0].size) * 8
+            if address is None or bits not in (16, 32):
+                return None
+            lines = [f"fpu_compare(fpu[0], (double)(int{bits}_t)load{bits}({address}));"]
+            if mnemonic == "ficomp":
+                lines.append("fpu_pop();")
+            return lines
+        if mnemonic == "fcompp" and not operands:
+            return ["fpu_compare(fpu[0], fpu[1]);", "fpu_pop();", "fpu_pop();"]
+        if mnemonic == "ftst" and not operands:
+            return ["fpu_compare(fpu[0], 0.0);"]
         if mnemonic == "fnstsw" and len(operands) == 1:
             write = self._write(instruction, operands[0], "fpu_status")
             return [write] if write else None
@@ -891,12 +953,41 @@ def _render_c(pages: dict[int, list[str]], used_apis: dict[str, ApiSpec]) -> str
         )
         page_dispatch.append(f"    case 0x{page:05x}u: return d2_page_{page:05x}(pc);")
     imports = []
+    host_thunk_dispatch = []
+    thunk_keys: dict[int, str] = {}
     for spec in sorted(used_apis.values(), key=lambda value: value.key):
         function = "api_" + safe_module_name(spec.library + "_" + spec.name).replace(".", "_").replace("-", "_")
         imports.append(
             f'__attribute__((import_module("win32.{spec.library.lower()}"), import_name("{spec.name}"))) '
             f'extern uint32_t {function}(uint32_t);'
         )
+        thunk_pc = host_thunk_pc(spec.key)
+        collision = thunk_keys.get(thunk_pc)
+        if collision is not None and collision != spec.key:
+            raise ValueError(
+                f"host thunk collision at 0x{thunk_pc:08x}: {collision} and {spec.key}"
+            )
+        thunk_keys[thunk_pc] = spec.key
+        cleanup = spec.arg_bytes if spec.convention == "stdcall" else 0
+        lines = [
+            f"  if (pc == 0x{thunk_pc:08x}u) {{",
+            "    uint32_t return_pc = load32(esp);",
+            f"    eax = {function}(esp + 4u);",
+        ]
+        if spec.no_return:
+            lines += [
+                "    d2_status = D2_STATUS_OK;",
+                "    return D2_ACTION_RETURN;",
+            ]
+        else:
+            lines += [
+                f"    esp += {4 + cleanup}u;",
+                "    d2_next_pc = return_pc;",
+                "    if (return_pc == D2_RETURN_SENTINEL) { d2_status = D2_STATUS_OK; return D2_ACTION_RETURN; }",
+                "    return D2_ACTION_CONTINUE;",
+            ]
+        lines.append("  }")
+        host_thunk_dispatch.extend(lines)
     has_dsound = any(key.lower() == "dsound.dll!#1" for key in used_apis)
     dsound_import = (
         '__attribute__((import_module("win32.dsound.dll"), import_name("__dispatch"))) '
@@ -928,6 +1019,7 @@ static uint32_t d2_dsound_arg_bytes(uint32_t method) {
         C_TEMPLATE.replace("@IMPORTS@", "\n".join(imports))
         .replace("@DSOUND_IMPORT@", dsound_import)
         .replace("@DSOUND_HELPERS@", dsound_helpers)
+        .replace("@HOST_THUNK_DISPATCH@", "\n".join(host_thunk_dispatch))
         .replace("@DSOUND_DISPATCH@", dsound_dispatch)
         .replace("@SHARDS@", "\n".join(shards))
         .replace("@PAGE_DISPATCH@", "\n".join(page_dispatch))
@@ -956,6 +1048,7 @@ static const char d2_dsound_description[] = "D2Wasm DirectSound";
 static const char d2_dsound_module[] = "dsound.dll";
 enum { D2_TRACE_CAPACITY = 16384u, D2_TRACE_MASK = D2_TRACE_CAPACITY - 1u };
 static uint32_t d2_trace_pc[D2_TRACE_CAPACITY], d2_trace_esp[D2_TRACE_CAPACITY], d2_trace_index;
+static uint32_t d2_diagnostics_enabled;
 static uint32_t d2_watch_pc, d2_watch_hit, d2_watch_registers[8], d2_stop_on_watch, d2_watch_skip;
 static uint32_t d2_count_pc, d2_count_hits;
 static uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp, fs_base;
@@ -964,7 +1057,10 @@ static double fpu[8];
 static uint32_t fpu_depth;
 static uint16_t fpu_status;
 static uint16_t fpu_control;
-static uint32_t d2_yield_requested;
+// Host imports can synchronously re-enter the module through
+// d2_request_yield().  Volatile makes that non-C re-entrancy visible to an
+// optimizing compiler at the dispatch boundary.
+static volatile uint32_t d2_yield_requested;
 
 typedef struct {
   uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp, fs_base;
@@ -1037,6 +1133,39 @@ static inline double fpu_integer_pow(double base, double exponent) {
     remaining >>= 1u;
   }
   return signed_exponent < 0 ? 1.0 / result : result;
+}
+static inline double fpu_log2(double value) {
+  union { double value; uint64_t bits; } data = { value };
+  if ((data.bits << 1u) == 0) return -1.0 / 0.0;
+  if (data.bits >> 63u) return 0.0 / 0.0;
+  uint32_t biased_exponent = (uint32_t)((data.bits >> 52u) & 0x7ffu);
+  if (biased_exponent == 0x7ffu) return value;
+  int32_t exponent;
+  if (!biased_exponent) {
+    data.value *= 4503599627370496.0;
+    biased_exponent = (uint32_t)((data.bits >> 52u) & 0x7ffu);
+    exponent = (int32_t)biased_exponent - 1023 - 52;
+  } else {
+    exponent = (int32_t)biased_exponent - 1023;
+  }
+  data.bits = (data.bits & 0x000fffffffffffffull) | 0x3ff0000000000000ull;
+  double ratio = (data.value - 1.0) / (data.value + 1.0);
+  double ratio_squared = ratio * ratio;
+  double term = ratio, series = ratio;
+  for (uint32_t denominator = 3; denominator <= 39; denominator += 2) {
+    term *= ratio_squared;
+    series += term / (double)denominator;
+  }
+  return (double)exponent + 2.0 * series * 1.44269504088896340735992468100189214;
+}
+static inline double fpu_exp2_fraction(double value) {
+  double exponent = value * 0.693147180559945309417232121458176568;
+  double term = 1.0, result = 1.0;
+  for (uint32_t index = 1; index <= 20; index++) {
+    term *= exponent / (double)index;
+    result += term;
+  }
+  return result;
 }
 static inline double fpu_sin(double value) {
   const double pi = 3.14159265358979323846264338327950288;
@@ -1165,6 +1294,7 @@ static inline uint32_t rotate_value(uint32_t value, uint32_t count, uint32_t bit
 
 __attribute__((noinline))
 static uint32_t d2_dispatch_block(uint32_t pc) {
+@HOST_THUNK_DISPATCH@
 @DSOUND_DISPATCH@
   switch (pc >> 12) {
 @PAGE_DISPATCH@
@@ -1191,19 +1321,21 @@ static uint32_t d2_execute(uint32_t block_fuel) {
   while (block_fuel--) {
     d2_previous_pc = d2_last_pc;
     d2_last_pc = d2_next_pc;
-    d2_trace_pc[d2_trace_index & D2_TRACE_MASK] = d2_next_pc;
-    d2_trace_esp[d2_trace_index & D2_TRACE_MASK] = esp;
-    d2_trace_index++;
-    if (d2_next_pc == d2_count_pc) d2_count_hits++;
-    if (!d2_watch_hit && d2_next_pc == d2_watch_pc) {
-      if (d2_watch_skip) { d2_watch_skip--; }
-      else {
-      d2_watch_hit = 1;
-      d2_watch_registers[0] = eax; d2_watch_registers[1] = ebx;
-      d2_watch_registers[2] = ecx; d2_watch_registers[3] = edx;
-      d2_watch_registers[4] = esi; d2_watch_registers[5] = edi;
-      d2_watch_registers[6] = ebp; d2_watch_registers[7] = esp;
-      if (d2_stop_on_watch) { d2_status = D2_STATUS_YIELDED; return eax; }
+    if (__builtin_expect(d2_diagnostics_enabled, 0)) {
+      d2_trace_pc[d2_trace_index & D2_TRACE_MASK] = d2_next_pc;
+      d2_trace_esp[d2_trace_index & D2_TRACE_MASK] = esp;
+      d2_trace_index++;
+      if (d2_next_pc == d2_count_pc) d2_count_hits++;
+      if (!d2_watch_hit && d2_next_pc == d2_watch_pc) {
+        if (d2_watch_skip) { d2_watch_skip--; }
+        else {
+        d2_watch_hit = 1;
+        d2_watch_registers[0] = eax; d2_watch_registers[1] = ebx;
+        d2_watch_registers[2] = ecx; d2_watch_registers[3] = edx;
+        d2_watch_registers[4] = esi; d2_watch_registers[5] = edi;
+        d2_watch_registers[6] = ebp; d2_watch_registers[7] = esp;
+        if (d2_stop_on_watch) { d2_status = D2_STATUS_YIELDED; return eax; }
+        }
       }
     }
     if (d2_dispatch_block(d2_next_pc) == D2_ACTION_RETURN) return eax;
@@ -1355,7 +1487,10 @@ __attribute__((export_name("d2_set_fs_base")))
 void d2_set_fs_base(uint32_t value) { fs_base = value; }
 
 __attribute__((export_name("d2_set_watch_pc")))
-void d2_set_watch_pc(uint32_t value) { d2_watch_pc = value; }
+void d2_set_watch_pc(uint32_t value) {
+  d2_watch_pc = value;
+  if (value) d2_diagnostics_enabled = 1;
+}
 
 __attribute__((export_name("d2_set_stop_on_watch")))
 void d2_set_stop_on_watch(uint32_t value) { d2_stop_on_watch = value; }
@@ -1364,7 +1499,13 @@ __attribute__((export_name("d2_set_watch_skip")))
 void d2_set_watch_skip(uint32_t value) { d2_watch_skip = value; }
 
 __attribute__((export_name("d2_set_count_pc")))
-void d2_set_count_pc(uint32_t value) { d2_count_pc = value; d2_count_hits = 0; }
+void d2_set_count_pc(uint32_t value) {
+  d2_count_pc = value; d2_count_hits = 0;
+  if (value) d2_diagnostics_enabled = 1;
+}
+
+__attribute__((export_name("d2_set_diagnostics")))
+void d2_set_diagnostics(uint32_t value) { d2_diagnostics_enabled = value != 0; }
 
 __attribute__((export_name("d2_count_hits")))
 uint32_t d2_get_count_hits(void) { return d2_count_hits; }
@@ -1383,10 +1524,23 @@ def compile_wasm(
     initial_memory: int = 16 * 1024 * 1024,
     opt_level: str = "0",
 ) -> None:
+    optimization_flags = []
+    if opt_level != "0":
+        # Lifted x86 depends on wrapping arithmetic and type-punned guest
+        # memory. Keep page dispatch functions separate so large linked builds
+        # remain acceptable to V8 while still allowing local optimization.
+        optimization_flags = [
+            "-fwrapv",
+            "-fno-strict-aliasing",
+            "-fno-inline-functions",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ]
     command = [
         "clang",
         "--target=wasm32-unknown-unknown",
         f"-O{opt_level}",
+        *optimization_flags,
         "-nostdlib",
         "-Wl,--no-entry",
         "-Wl,--export-memory",
