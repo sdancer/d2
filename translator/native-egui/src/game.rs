@@ -14,7 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 use wasmtime::{
-    Caller, Engine, Error as WasmtimeError, Extern, ExternType, Linker, Memory, Module, Store, Val,
+    Caller, Engine, Error as WasmtimeError, Extern, ExternType, Instance, Linker, Memory, Module,
+    Store, Val,
 };
 
 const STACK_TOP: u32 = 0x1000_0000;
@@ -121,6 +122,16 @@ pub fn run(
 
     let set_fs_base = wt(instance.get_typed_func::<u32, ()>(&mut store, "d2_set_fs_base"))?;
     wt(set_fs_base.call(&mut store, FS_BASE))?;
+    let stop_trace_limit = environment_u32("D2_STOP_TRACE")?.filter(|limit| *limit != 0);
+    if environment_u32("D2_DIAGNOSTICS")?.unwrap_or(0) != 0 || stop_trace_limit.is_some() {
+        let set_diagnostics =
+            wt(instance.get_typed_func::<u32, ()>(&mut store, "d2_set_diagnostics"))?;
+        wt(set_diagnostics.call(&mut store, 1))?;
+        send(
+            &event_tx,
+            HostEvent::Log(String::from("Translated diagnostics enabled")),
+        );
+    }
     let run = wt(instance.get_typed_func::<(u32, u32, u32), u32>(&mut store, "d2_run"))?;
     let last_status = wt(instance.get_typed_func::<(), u32>(&mut store, "d2_last_status"))?;
 
@@ -249,10 +260,29 @@ pub fn run(
             let presentation_delta = presentations.saturating_sub(fps_sample_presentations);
             let virtual_delta = virtual_ms.wrapping_sub(fps_sample_virtual_ms);
             let round_delta = rounds - fps_sample_round;
+            let thread_contexts = store.data().runtime.thread_contexts();
+            let (next_pc, last_pc, thread_state) = {
+                let bytes = memory.data(&store);
+                let thread_state = thread_contexts
+                    .iter()
+                    .map(|(handle, thread_context)| {
+                        let next = read_u32(bytes, thread_context + 12).unwrap_or(0);
+                        let status = read_u32(bytes, thread_context + 24).unwrap_or(0);
+                        format!("{handle:#x}:{next:#010x}/s{status}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                (
+                    read_u32(bytes, context + 12).unwrap_or(0),
+                    read_u32(bytes, context + 16).unwrap_or(0),
+                    thread_state,
+                )
+            };
             let report = format!(
                 "FPS sample: wall={elapsed:.3}s, presentations={presentation_delta}, \
                  fps={:.2}, rounds={round_delta}, rounds_per_second={:.2}, \
-                 virtual_ms={virtual_delta}, clock_rate={:.2}x",
+                 virtual_ms={virtual_delta}, clock_rate={:.2}x, \
+                 main={next_pc:#010x}/{last_pc:#010x}, threads=[{thread_state}]",
                 presentation_delta as f64 / elapsed,
                 round_delta as f64 / elapsed,
                 f64::from(virtual_delta) / (elapsed * 1_000.0),
@@ -278,6 +308,20 @@ pub fn run(
                 .map(|value| format!("{value:08x}"))
                 .collect::<Vec<_>>()
                 .join(" ");
+            if let Some(limit) = stop_trace_limit {
+                let trace = capture_stopped_context_trace(
+                    &instance,
+                    &mut store,
+                    last_pc,
+                    previous_pc,
+                    limit.min(16_384),
+                )?;
+                eprintln!("Stopped context translated trace:\n{trace}");
+                send(
+                    &event_tx,
+                    HostEvent::Log(format!("Stopped context translated trace:\n{trace}")),
+                );
+            }
             let unknown_apis = store.data().runtime.unknown_api_summary();
             if let (Some(address), Some(counter)) = (count_pc, count_hits.as_ref()) {
                 let hits = wt(counter.call(&mut store, ()))?;
@@ -303,6 +347,49 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+fn capture_stopped_context_trace(
+    instance: &Instance,
+    store: &mut Store<HostState>,
+    last_pc: u32,
+    previous_pc: u32,
+    limit: u32,
+) -> Result<String> {
+    const TRACE_CAPACITY: u32 = 16_384;
+    let trace_pc = wt(instance.get_typed_func::<u32, u32>(&mut *store, "d2_trace_pc"))?;
+    let trace_esp = wt(instance.get_typed_func::<u32, u32>(&mut *store, "d2_trace_esp"))?;
+    let mut entries = Vec::with_capacity(TRACE_CAPACITY as usize);
+    for back in 0..TRACE_CAPACITY {
+        entries.push((
+            wt(trace_pc.call(&mut *store, back))?,
+            wt(trace_esp.call(&mut *store, back))?,
+        ));
+    }
+    let anchor = entries
+        .iter()
+        .enumerate()
+        .find_map(|(index, &(pc, _))| {
+            (pc == last_pc
+                && entries
+                    .get((index + 1) % entries.len())
+                    .is_some_and(|&(previous, _)| previous == previous_pc))
+            .then_some(index)
+        })
+        .or_else(|| entries.iter().position(|&(pc, _)| pc == last_pc));
+    let Some(anchor) = anchor else {
+        return Ok(format!(
+            "  final PC {last_pc:#010x} was not found in the retained trace buffer"
+        ));
+    };
+    Ok((0..limit as usize)
+        .map(|offset| {
+            let index = (anchor + offset) % entries.len();
+            let (pc, esp) = entries[index];
+            format!("  {offset:04}: pc={pc:#010x} esp={esp:#010x}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn environment_u32(name: &str) -> Result<Option<u32>> {
