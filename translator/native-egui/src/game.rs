@@ -11,6 +11,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::mpsc::{Receiver, SyncSender},
+    time::{Duration, Instant},
 };
 use wasmtime::{
     Caller, Engine, Error as WasmtimeError, Extern, ExternType, Linker, Memory, Module, Store, Val,
@@ -200,6 +201,13 @@ pub fn run(
         HostEvent::Status(String::from("Running — click the game surface to interact")),
     );
 
+    let fps_interval = environment_u32("D2_FPS_LOG_MS")?
+        .filter(|milliseconds| *milliseconds != 0)
+        .map(|milliseconds| Duration::from_millis(u64::from(milliseconds)));
+    let mut fps_sample_started = Instant::now();
+    let (mut fps_sample_presentations, mut fps_sample_virtual_ms) =
+        store.data().runtime.timing_counters();
+    let mut fps_sample_round = 0u64;
     let mut rounds = 0u64;
     let mut reported_watch_contexts = HashSet::new();
     loop {
@@ -232,6 +240,29 @@ pub fn run(
                     "Running — round {rounds}, result={result:#x}, status={status}"
                 )),
             );
+        }
+        if let Some(interval) = fps_interval
+            && fps_sample_started.elapsed() >= interval
+        {
+            let elapsed = fps_sample_started.elapsed().as_secs_f64();
+            let (presentations, virtual_ms) = store.data().runtime.timing_counters();
+            let presentation_delta = presentations.saturating_sub(fps_sample_presentations);
+            let virtual_delta = virtual_ms.wrapping_sub(fps_sample_virtual_ms);
+            let round_delta = rounds - fps_sample_round;
+            let report = format!(
+                "FPS sample: wall={elapsed:.3}s, presentations={presentation_delta}, \
+                 fps={:.2}, rounds={round_delta}, rounds_per_second={:.2}, \
+                 virtual_ms={virtual_delta}, clock_rate={:.2}x",
+                presentation_delta as f64 / elapsed,
+                round_delta as f64 / elapsed,
+                f64::from(virtual_delta) / (elapsed * 1_000.0),
+            );
+            eprintln!("{report}");
+            send(&event_tx, HostEvent::Log(report));
+            fps_sample_started = Instant::now();
+            fps_sample_presentations = presentations;
+            fps_sample_virtual_ms = virtual_ms;
+            fps_sample_round = rounds;
         }
         if store.data().runtime.quit_requested() {
             break;

@@ -467,6 +467,10 @@ impl Runtime {
         self.quit_requested
     }
 
+    pub fn timing_counters(&self) -> (u64, u32) {
+        (self.screen_presentations, self.virtual_time)
+    }
+
     pub fn prepare_invoke(
         &mut self,
         memory: &mut [u8],
