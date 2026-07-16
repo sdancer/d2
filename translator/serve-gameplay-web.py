@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve the translated Diablo II Chrome harness")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=8089)
     parser.add_argument("--open", action="store_true", help="open Chromium after the server starts")
     parser.add_argument("--source-dir", type=Path, default=ROOT.parent / "extracted")
     parser.add_argument("--host-root", type=Path, default=ROOT / "build/runtime-files/diablo2")

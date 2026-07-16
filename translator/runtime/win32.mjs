@@ -9,6 +9,11 @@ export class Win32Runtime {
     this.exitCode = null;
     this.stdout = options.stdout ?? ((text) => isNodeHost ? process.stdout.write(text) : console.log(text));
     this.environment = options.environment ?? (isNodeHost ? process.env : {});
+    this.diagnostics = options.diagnostics
+      ?? ["1", "true"].includes(String(this.environment.D2_DIAGNOSTICS ?? "").toLowerCase());
+    this.cooperativeTiming = options.cooperativeTiming ?? false;
+    this.yieldOnPresent = options.yieldOnPresent ?? false;
+    this.mainResumeAt = 0;
     this.commandLine = options.commandLine ?? '"C:\\Diablo II\\Diablo II.exe" -w';
     this.moduleFilename = options.moduleFilename ?? "C:\\Diablo II\\Diablo II.exe";
     this.heapCursor = options.heapBase ?? 0x00800000;
@@ -48,9 +53,17 @@ export class Win32Runtime {
     this.messageQueue = [];
     this.onPresent = options.onPresent ?? null;
     this.onAudio = options.onAudio ?? null;
+    this.soundEnabled = options.soundEnabled ?? true;
+    this.onGlide = options.onGlide ?? null;
+    this.glideWidth = 640;
+    this.glideHeight = 480;
+    this.glideLfbPointer = 0;
+    this.glideLfbStride = 0;
+    this.glideStrings = new Map();
     this.cursorX = 0;
     this.cursorY = 0;
     this.autoClickIndex = 0;
+    this.autoClickRelease = null;
     this.autoTextQueued = false;
     this.registryValues = new Map([
       ["installpath", "C:\\Diablo II"],
@@ -68,6 +81,8 @@ export class Win32Runtime {
     this.nextSoundId = 1;
     this.directSoundCreatedReported = false;
     this.directSoundPlaybackReported = false;
+    this.directSoundCalls = [];
+    this.directSoundCallCount = 0;
   }
 
   attach(memory, exports = null) {
@@ -247,6 +262,7 @@ export class Win32Runtime {
       volume: buffer.volume,
       pan: buffer.pan,
       frequency: buffer.frequency || buffer.format.samplesPerSec,
+      cursor: buffer.currentPosition || 0,
     });
     if (!this.directSoundPlaybackReported) {
       this.directSoundPlaybackReported = true;
@@ -254,7 +270,95 @@ export class Win32Runtime {
     }
   }
 
+  emitSoundWrite(buffer, pointer, size) {
+    if (!this.onAudio || !buffer.playing || !pointer || !size) return;
+    const offset = pointer - buffer.bytes;
+    if (offset < 0 || offset >= buffer.size) return;
+    const count = Math.min(size, buffer.size - offset);
+    const bytes = new Uint8Array(this.memory.buffer, pointer, count).slice();
+    this.onAudio({ type: "write", id: buffer.id, offset, bytes });
+  }
+
+  emitSoundControl(buffer, detail) {
+    if (this.onAudio && buffer.playing) {
+      this.onAudio({ type: "control", id: buffer.id, ...detail });
+    }
+  }
+
+  directSoundMethodName(method) {
+    const device = [
+      "QueryInterface", "AddRef", "Release", "CreateSoundBuffer", "GetCaps",
+      "DuplicateSoundBuffer", "SetCooperativeLevel", "Compact", "GetSpeakerConfig",
+      "SetSpeakerConfig", "Initialize",
+    ];
+    const buffer = [
+      "QueryInterface", "AddRef", "Release", "GetCaps", "GetCurrentPosition",
+      "GetFormat", "GetVolume", "GetPan", "GetFrequency", "GetStatus", "Initialize",
+      "Lock", "Play", "SetCurrentPosition", "SetFormat", "SetVolume", "SetPan",
+      "SetFrequency", "Stop", "Unlock", "Restore",
+    ];
+    if (method < device.length) return `IDirectSound::${device[method]}`;
+    if (method >= 32 && method - 32 < buffer.length) {
+      return `IDirectSoundBuffer::${buffer[method - 32]}`;
+    }
+    return `DirectSound method ${method}`;
+  }
+
+  recordDirectSoundCall(method, sp, args, result, error = null) {
+    const call = {
+      sequence: ++this.directSoundCallCount,
+      method,
+      name: this.directSoundMethodName(method),
+      sp: sp >>> 0,
+      object: args[0] ?? 0,
+      args,
+      result: result >>> 0,
+      error,
+    };
+    this.directSoundCalls.push(call);
+    if (this.directSoundCalls.length > 64) this.directSoundCalls.shift();
+    if (call.sequence <= 64) this.events.push({ type: "direct-sound-call", ...call });
+  }
+
+  soundBytesPerSecond(buffer) {
+    const baseRate = Math.max(1, buffer.format.samplesPerSec);
+    return Math.max(1, Math.floor(
+      buffer.format.avgBytesPerSec * Math.max(1, buffer.frequency) / baseRate,
+    ));
+  }
+
+  refreshSoundPlayback(buffer, now = this.clockNow()) {
+    if (!buffer.playing || buffer.playFlags & 1 || !buffer.size) return;
+    const elapsed = Math.max(0, now - buffer.playStarted);
+    if (elapsed * this.soundBytesPerSecond(buffer) >= buffer.size * 1000) {
+      buffer.playing = false;
+    }
+  }
+
   dispatchDirectSound(method, sp) {
+    if (!this.diagnostics) return this.dispatchDirectSoundMethod(method, sp) >>> 0;
+    const deviceBytes = [12, 4, 4, 16, 8, 12, 12, 4, 8, 8, 8];
+    const bufferBytes = [12, 4, 4, 8, 12, 16, 8, 8, 8, 8, 12, 32, 16, 8, 8, 8, 8, 8, 4, 20, 4];
+    const argumentBytes = method < deviceBytes.length
+      ? deviceBytes[method]
+      : method >= 32 && method - 32 < bufferBytes.length
+        ? bufferBytes[method - 32]
+        : 4;
+    const args = Array.from(
+      { length: argumentBytes / 4 },
+      (_value, index) => this.arg(sp, index),
+    );
+    try {
+      const result = this.dispatchDirectSoundMethod(method, sp) >>> 0;
+      this.recordDirectSoundCall(method, sp, args, result);
+      return result;
+    } catch (error) {
+      this.recordDirectSoundCall(method, sp, args, 0xffffffff, error.message);
+      throw error;
+    }
+  }
+
+  dispatchDirectSoundMethod(method, sp) {
     const view = this.view();
     const object = this.arg(sp, 0);
     if (method <= 2 || (method >= 32 && method <= 34)) {
@@ -281,7 +385,7 @@ export class Win32Runtime {
           id: this.nextSoundId++, object: bufferObject, primary, flags, size,
           bytes: primary || !size ? 0 : this.alloc(size, 16), format,
           volume: 0, pan: 0, frequency: format.samplesPerSec,
-          playing: false, playFlags: 0, playStarted: 0,
+          playing: false, playFlags: 0, playStarted: 0, currentPosition: 0,
         };
         this.soundBuffers.set(bufferObject, buffer);
         this.view().setUint32(output, bufferObject, true);
@@ -315,9 +419,13 @@ export class Win32Runtime {
         if (size >= 12) view.setUint32(output + 8, buffer.size, true);
       }
     } else if (relative === 4) {
-      const elapsed = buffer.playing ? Math.max(0, this.clockNow() - buffer.playStarted) : 0;
-      const cursor = buffer.size && buffer.format.avgBytesPerSec
-        ? Math.floor(elapsed * buffer.format.avgBytesPerSec / 1000) % buffer.size : 0;
+      const now = this.clockNow();
+      const elapsed = buffer.playing ? Math.max(0, now - buffer.playStarted) : 0;
+      const played = Math.floor(elapsed * this.soundBytesPerSecond(buffer) / 1000);
+      this.refreshSoundPlayback(buffer, now);
+      const cursor = buffer.size
+        ? buffer.playFlags & 1 ? played % buffer.size : Math.min(played, buffer.size - 1)
+        : 0;
       const play = this.arg(sp, 1), write = this.arg(sp, 2);
       if (play) view.setUint32(play, cursor, true);
       if (write) view.setUint32(write, buffer.size ? (cursor + buffer.format.blockAlign * 4) % buffer.size : 0, true);
@@ -332,6 +440,7 @@ export class Win32Runtime {
     } else if (relative === 8) {
       const output = this.arg(sp, 1); if (output) view.setUint32(output, buffer.frequency, true);
     } else if (relative === 9) {
+      this.refreshSoundPlayback(buffer);
       const output = this.arg(sp, 1); if (output) view.setUint32(output, buffer.playing ? 1 | (buffer.playFlags & 1 ? 4 : 0) : 0, true);
     } else if (relative === 11) {
       if (!buffer.bytes || !buffer.size) return 0x88780032;
@@ -347,21 +456,38 @@ export class Win32Runtime {
     } else if (relative === 12) {
       buffer.playFlags = this.arg(sp, 3);
       buffer.playing = true;
-      buffer.playStarted = this.clockNow();
+      buffer.playStarted = this.clockNow()
+        - Math.floor(buffer.currentPosition * 1000 / this.soundBytesPerSecond(buffer));
       this.emitSound(buffer);
     } else if (relative === 13) {
-      buffer.playStarted = this.clockNow() - Math.floor(this.arg(sp, 1) * 1000 / Math.max(1, buffer.format.avgBytesPerSec));
+      buffer.currentPosition = buffer.size ? this.arg(sp, 1) % buffer.size : 0;
+      buffer.playStarted = this.clockNow()
+        - Math.floor(buffer.currentPosition * 1000 / this.soundBytesPerSecond(buffer));
+      this.emitSoundControl(buffer, { cursor: buffer.currentPosition });
     } else if (relative === 14) {
       buffer.format = this.readWaveFormat(this.arg(sp, 1));
     } else if (relative === 15) {
       buffer.volume = this.arg(sp, 1) | 0;
+      this.emitSoundControl(buffer, { volume: buffer.volume });
     } else if (relative === 16) {
       buffer.pan = this.arg(sp, 1) | 0;
+      this.emitSoundControl(buffer, { pan: buffer.pan });
     } else if (relative === 17) {
       buffer.frequency = this.arg(sp, 1);
+      this.emitSoundControl(buffer, { frequency: buffer.frequency });
     } else if (relative === 18) {
+      if (buffer.playing && buffer.size) {
+        const elapsed = Math.max(0, this.clockNow() - buffer.playStarted);
+        const played = Math.floor(elapsed * this.soundBytesPerSecond(buffer) / 1000);
+        buffer.currentPosition = buffer.playFlags & 1
+          ? played % buffer.size
+          : Math.min(played, buffer.size - 1);
+      }
       buffer.playing = false;
       this.onAudio?.({ type: "stop", id: buffer.id });
+    } else if (relative === 19) {
+      this.emitSoundWrite(buffer, this.arg(sp, 1), this.arg(sp, 2));
+      this.emitSoundWrite(buffer, this.arg(sp, 3), this.arg(sp, 4));
     }
     return 0;
   }
@@ -458,6 +584,70 @@ export class Win32Runtime {
     this.enqueueMessage(this.activeWindow, 0x0102, codePoint, 1);
   }
 
+  runPresentationAutomation() {
+    const clickSchedule = this.environment.D2_AUTO_CLICKS ?? this.environment.D2_AUTO_CLICK;
+    if (clickSchedule) {
+      const clicks = clickSchedule.split(";").filter(Boolean);
+      if (this.autoClickRelease
+          && this.screenPresentations >= this.autoClickRelease.presentation) {
+        const { hwnd, lParam } = this.autoClickRelease;
+        this.enqueueMessage(hwnd, 0x202, 0, lParam);
+        this.autoClickRelease = null;
+        this.autoClickIndex++;
+      } else if (!this.autoClickRelease && this.autoClickIndex < clicks.length) {
+        const [xText, yText, presentationText] = clicks[this.autoClickIndex].split(",");
+        const presentation = Number(presentationText || 350);
+        if (this.screenPresentations >= presentation) {
+          this.cursorX = Number(xText || 400);
+          this.cursorY = Number(yText || 208);
+          const hwnd = this.activeWindow;
+          const lParam = ((this.cursorY & 0xffff) << 16 | this.cursorX & 0xffff) >>> 0;
+          this.enqueueMessage(hwnd, 0x200, 0, lParam);
+          this.enqueueMessage(hwnd, 0x201, 1, lParam);
+          this.autoClickRelease = {
+            hwnd,
+            lParam,
+            presentation: this.screenPresentations + 10,
+          };
+        }
+      }
+    }
+    if (!this.autoTextQueued && this.environment.D2_AUTO_TEXT) {
+      const separator = this.environment.D2_AUTO_TEXT.lastIndexOf(",");
+      const text = separator < 0
+        ? this.environment.D2_AUTO_TEXT
+        : this.environment.D2_AUTO_TEXT.slice(0, separator);
+      const presentation = Number(
+        separator < 0 ? 600 : this.environment.D2_AUTO_TEXT.slice(separator + 1),
+      );
+      if (this.screenPresentations >= presentation) {
+        for (const character of text) {
+          const code = character.codePointAt(0);
+          const virtualKey = code >= 0x61 && code <= 0x7a ? code - 0x20 : code;
+          this.enqueueMessage(this.activeWindow, 0x100, virtualKey, 1);
+          this.enqueueMessage(this.activeWindow, 0x102, code, 1);
+          this.enqueueMessage(this.activeWindow, 0x101, virtualKey, 1);
+        }
+        this.autoTextQueued = true;
+      }
+    }
+  }
+
+  completePresentation(width, height, render) {
+    this.screenPresentations++;
+    this.presentationWidth = Math.max(1, width | 0);
+    this.presentationHeight = Math.max(1, height | 0);
+    if (this.delayedWatchPc !== undefined
+        && this.screenPresentations >= this.delayedWatchPresentation) {
+      this.exports?.d2_set_watch_pc?.(this.delayedWatchPc);
+      this.delayedWatchPc = undefined;
+    }
+    this.runPresentationAutomation();
+    const presented = render?.(this.screenPresentations);
+    if (this.yieldOnPresent && presented !== false) this.exports?.d2_request_yield?.();
+    return presented;
+  }
+
   writeMessage(pointer, message) {
     const view = this.view();
     view.setUint32(pointer, message.hwnd, true);
@@ -488,11 +678,13 @@ export class Win32Runtime {
           ),
         };
       }
-      const event = { type: "callback", address, args, result, status, currentStack: true };
-      this.schedulerEvents.push(event);
-      this.callbackEvents ??= [];
-      this.callbackEvents.push(event);
-      if (this.callbackEvents.length > 64) this.callbackEvents.shift();
+      if (this.diagnostics) {
+        const event = { type: "callback", address, args, result, status, currentStack: true };
+        this.schedulerEvents.push(event);
+        this.callbackEvents ??= [];
+        this.callbackEvents.push(event);
+        if (this.callbackEvents.length > 64) this.callbackEvents.shift();
+      }
       return result;
     }
     const stackSize = 0x10000;
@@ -521,15 +713,17 @@ export class Win32Runtime {
     } finally {
       this.callbackDepth--;
     }
-    const event = { type: "callback", address, args, result, status };
-    this.schedulerEvents.push(event);
-    this.callbackEvents ??= [];
-    this.callbackEvents.push(event);
-    if (this.callbackEvents.length > 64) this.callbackEvents.shift();
+    if (this.diagnostics) {
+      const event = { type: "callback", address, args, result, status };
+      this.schedulerEvents.push(event);
+      this.callbackEvents ??= [];
+      this.callbackEvents.push(event);
+      if (this.callbackEvents.length > 64) this.callbackEvents.shift();
+    }
     return result;
   }
 
-  runThread(thread) {
+  runThread(thread, fuel = 1_000_000) {
     if (thread.finished || !this.exports?.d2_run_context) return;
     const previous = this.currentThread;
     this.currentThread = thread;
@@ -538,7 +732,7 @@ export class Win32Runtime {
         thread.context,
         thread.start,
         thread.stackTop,
-        1_000_000,
+        fuel,
       ) >>> 0;
       thread.status = this.exports.d2_context_status(thread.context) >>> 0;
       thread.finished = Boolean(this.exports.d2_context_finished(thread.context));
@@ -553,30 +747,73 @@ export class Win32Runtime {
           ),
         });
       }
-      this.schedulerEvents.push({
-        type: "thread-run", handle: thread.handle, start: thread.start,
-        status: thread.status, finished: thread.finished, exitCode: thread.exitCode,
-      });
-      if (this.schedulerEvents.length > 128) this.schedulerEvents.shift();
+      if (this.diagnostics) {
+        this.schedulerEvents.push({
+          type: "thread-run", handle: thread.handle, start: thread.start,
+          status: thread.status, finished: thread.finished, exitCode: thread.exitCode,
+        });
+        if (this.schedulerEvents.length > 128) this.schedulerEvents.shift();
+      }
     } finally {
       this.currentThread = previous;
     }
   }
 
+  runPendingThreads(fuel = 50_000) {
+    const now = this.clockNow();
+    const pending = Array.from(this.handles.values())
+      .filter((item) => item.type === "thread" && !item.finished)
+      .filter((thread) => {
+        if (!this.cooperativeTiming || !thread.resumeAt || thread.resumeAt <= now) return true;
+        return thread.waitHandle && this.handles.get(thread.waitHandle)?.signaled;
+      });
+    for (const thread of pending) {
+      thread.resumeAt = 0;
+      thread.waitHandle = 0;
+      this.runThread(thread, fuel);
+    }
+  }
+
+  sleep(milliseconds) {
+    if (!this.cooperativeTiming) {
+      this.advanceClock(milliseconds);
+      return 0;
+    }
+    if (!milliseconds) {
+      // The game's main loop calls Sleep(0) twice per iteration. A browser
+      // timer here clamps the loop to a few frames per second; presentation
+      // itself is already the cooperative compositor boundary.
+      if (this.currentThread) this.exports?.d2_request_yield?.();
+      return 0;
+    }
+    const resumeAt = this.clockNow() + (milliseconds >>> 0);
+    if (this.currentThread) this.currentThread.resumeAt = resumeAt;
+    else this.mainResumeAt = resumeAt;
+    this.exports?.d2_request_yield?.();
+    return 0;
+  }
+
   waitForSingleObject(handle, timeout) {
     const target = this.handles.get(handle);
-    this.schedulerEvents.push({
-      type: "wait", handle, timeout, targetType: target?.type ?? null,
-      signaled: target?.signaled ?? null, currentThread: this.currentThread?.handle ?? null,
-    });
-    if (this.schedulerEvents.length > 128) this.schedulerEvents.shift();
+    if (this.diagnostics) {
+      this.schedulerEvents.push({
+        type: "wait", handle, timeout, targetType: target?.type ?? null,
+        signaled: target?.signaled ?? null, currentThread: this.currentThread?.handle ?? null,
+      });
+      if (this.schedulerEvents.length > 128) this.schedulerEvents.shift();
+    }
     const consumeSignal = () => {
       if (!target?.signaled) return false;
       if (target.type === "event" && !target.manualReset) target.signaled = false;
       return true;
     };
     if (consumeSignal() || target?.type === "thread" && target.finished) return 0;
-    if (this.currentThread) {
+    if (timeout === 0) return 258;
+    if (this.currentThread && timeout !== 0) {
+      this.currentThread.waitHandle = handle;
+      this.currentThread.resumeAt = timeout === 0xffffffff
+        ? Infinity
+        : this.clockNow() + (timeout >>> 0);
       this.exports?.d2_request_yield?.();
       return timeout === 0xffffffff ? 0 : 258;
     }
@@ -658,7 +895,7 @@ export class Win32Runtime {
       TlsSetValue: (sp) => { this.tls.set(this.arg(sp, 0), this.arg(sp, 1)); return 1; },
       TlsGetValue: (sp) => this.tls.get(this.arg(sp, 0)) ?? 0,
       GetTickCount: () => this.clockNow(),
-      Sleep: (sp) => { this.advanceClock(this.arg(sp, 0)); return 0; },
+      Sleep: (sp) => this.sleep(this.arg(sp, 0)),
       WaitForSingleObject: (sp) => this.waitForSingleObject(this.arg(sp, 0), this.arg(sp, 1)),
       WaitForMultipleObjects: () => 0,
       CloseHandle: (sp) => {
@@ -678,7 +915,16 @@ export class Win32Runtime {
         });
         return handle;
       },
-      SetEvent: (sp) => { const event = this.handles.get(this.arg(sp, 0)); if (event) event.signaled = true; return event ? 1 : 0; },
+      SetEvent: (sp) => {
+        const handle = this.arg(sp, 0), event = this.handles.get(handle);
+        if (event) {
+          event.signaled = true;
+          for (const thread of this.handles.values()) {
+            if (thread.type === "thread" && thread.waitHandle === handle) thread.resumeAt = 0;
+          }
+        }
+        return event ? 1 : 0;
+      },
       ResetEvent: (sp) => { const event = this.handles.get(this.arg(sp, 0)); if (event) event.signaled = false; return event ? 1 : 0; },
       SetUnhandledExceptionFilter: (sp) => {
         const previous = this.unhandledExceptionFilter;
@@ -1635,68 +1881,235 @@ export class Win32Runtime {
           const sourceRow = source.topDown ? sy + row : source.height - 1 - sy - row;
           const destinationRow = destination.topDown ? dy + row : destination.height - 1 - dy - row;
           if (destination.bitsPerPixel === 32 && source.bitsPerPixel === 32) {
-            const bytes = new Uint8Array(this.memory.buffer, source.bits + sourceRow * source.stride + sx * 4, count * 4).slice();
+            const bytes = new Uint8Array(this.memory.buffer, source.bits + sourceRow * source.stride + sx * 4, count * 4);
             new Uint8Array(this.memory.buffer, destination.bits + destinationRow * destination.stride + dx * 4, count * 4).set(bytes);
           } else if (destination.bitsPerPixel === 32 && source.bitsPerPixel === 8) {
             const input = new Uint8Array(this.memory.buffer, source.bits + sourceRow * source.stride + sx, count);
             const output = new DataView(this.memory.buffer, destination.bits + destinationRow * destination.stride + dx * 4, count * 4);
             for (let column = 0; column < count; column++) output.setUint32(column * 4, source.palette?.[input[column]] ?? 0xff000000, true);
           } else if (destination.bitsPerPixel === 8 && source.bitsPerPixel === 8) {
-            const bytes = new Uint8Array(this.memory.buffer, source.bits + sourceRow * source.stride + sx, count).slice();
+            const bytes = new Uint8Array(this.memory.buffer, source.bits + sourceRow * source.stride + sx, count);
             new Uint8Array(this.memory.buffer, destination.bits + destinationRow * destination.stride + dx, count).set(bytes);
           }
         }
         if (destination.screen) {
-          this.screenPresentations++;
-          this.presentationWidth = Math.max(1, Math.min(destination.width - Math.max(dx, 0), source.width - Math.max(sx, 0), width));
-          this.presentationHeight = Math.max(1, Math.min(destination.height - Math.max(dy, 0), source.height - Math.max(sy, 0), height));
-          if (this.delayedWatchPc !== undefined
-              && this.screenPresentations >= this.delayedWatchPresentation) {
-            this.exports?.d2_set_watch_pc?.(this.delayedWatchPc);
-            this.delayedWatchPc = undefined;
-          }
-        }
-        const clickSchedule = this.environment.D2_AUTO_CLICKS ?? this.environment.D2_AUTO_CLICK;
-        if (destination.screen && clickSchedule) {
-          const clicks = clickSchedule.split(";").filter(Boolean);
-          if (this.autoClickIndex < clicks.length) {
-            const [xText, yText, presentationText] = clicks[this.autoClickIndex].split(",");
-            const presentation = Number(presentationText || 350);
-            if (this.screenPresentations >= presentation) {
-              this.cursorX = Number(xText || 400); this.cursorY = Number(yText || 208);
-              const hwnd = this.activeWindow;
-              const lParam = ((this.cursorY & 0xffff) << 16 | this.cursorX & 0xffff) >>> 0;
-              this.enqueueMessage(hwnd, 0x200, 0, lParam);
-              this.enqueueMessage(hwnd, 0x201, 1, lParam);
-              this.enqueueMessage(hwnd, 0x202, 0, lParam);
-              this.autoClickIndex++;
-            }
-          }
-        }
-        if (destination.screen && !this.autoTextQueued && this.environment.D2_AUTO_TEXT) {
-          const separator = this.environment.D2_AUTO_TEXT.lastIndexOf(",");
-          const text = separator < 0 ? this.environment.D2_AUTO_TEXT : this.environment.D2_AUTO_TEXT.slice(0, separator);
-          const presentation = Number(separator < 0 ? 600 : this.environment.D2_AUTO_TEXT.slice(separator + 1));
-          if (this.screenPresentations >= presentation) {
-            for (const character of text) {
-              const code = character.codePointAt(0);
-              this.enqueueMessage(this.activeWindow, 0x100, code >= 0x61 && code <= 0x7a ? code - 0x20 : code, 1);
-              this.enqueueMessage(this.activeWindow, 0x102, code, 1);
-              this.enqueueMessage(this.activeWindow, 0x101, code >= 0x61 && code <= 0x7a ? code - 0x20 : code, 1);
-            }
-            this.autoTextQueued = true;
-          }
-        }
-        if (destination.screen && this.onPresent) {
-          this.onPresent(destination, this.screenPresentations, {
-            width: this.presentationWidth,
-            height: this.presentationHeight,
-          });
+          const presentationWidth = Math.max(1, Math.min(
+            destination.width - Math.max(dx, 0),
+            source.width - Math.max(sx, 0),
+            width,
+          ));
+          const presentationHeight = Math.max(1, Math.min(
+            destination.height - Math.max(dy, 0),
+            source.height - Math.max(sy, 0),
+            height,
+          ));
+          this.completePresentation(presentationWidth, presentationHeight, (presentation) =>
+            this.onPresent?.(destination, presentation, {
+              width: presentationWidth,
+              height: presentationHeight,
+            })
+          );
         }
         return 1;
       },
       GdiFlush: () => 1,
       GdiSetBatchLimit: () => 1,
+    };
+  }
+
+  glide3x() {
+    const emit = (type, detail = {}) => this.onGlide?.({ type, ...detail });
+    const textureInfo = (pointer) => {
+      const view = this.view();
+      const smallLod = view.getInt32(pointer, true);
+      const largeLod = view.getInt32(pointer + 4, true);
+      const aspect = view.getInt32(pointer + 8, true);
+      const maxDimension = 1 << Math.max(0, Math.min(12, largeLod));
+      const width = aspect >= 0 ? maxDimension : maxDimension >> -aspect;
+      const height = aspect <= 0 ? maxDimension : maxDimension >> aspect;
+      return {
+        pointer,
+        smallLod,
+        largeLod,
+        aspect,
+        format: view.getUint32(pointer + 12, true),
+        data: view.getUint32(pointer + 16, true),
+        width: Math.max(1, width),
+        height: Math.max(1, height),
+      };
+    };
+    const draw = (type, sp, detail = {}) => {
+      emit("draw", { drawType: type, ...detail });
+      return 0;
+    };
+    const state = (type, names) => (sp) => {
+      emit(type, Object.fromEntries(names.map((name, index) => [name, this.arg(sp, index)])));
+      return 0;
+    };
+    const getValues = new Map([
+      [0x05, 256], // GR_GAMMA_TABLE_ENTRIES
+      [0x0a, 256], // GR_MAX_TEXTURE_SIZE
+      [0x0b, 3],   // GR_MAX_TEXTURE_ASPECT_RATIO
+      [0x0e, 0],   // GR_MEMORY_UMA
+      [0x0f, 1],   // GR_NUM_BOARDS
+      [0x11, 1],   // GR_NUM_FB
+      [0x13, 1],   // GR_NUM_TMU
+      [0x24, 256], // GR_TEXTURE_ALIGN
+      [0x2a, 8],   // GR_BITS_GAMMA
+    ]);
+    const strings = new Map([
+      [0xa0, " "],
+      [0xa1, "Voodoo2"],
+      [0xa2, "d2wasm WebGL2 Glide"],
+      [0xa3, "3Dfx Interactive"],
+      [0xa4, "3.0"],
+    ]);
+    return {
+      "_grGlideInit@0": () => { emit("init"); return 0; },
+      "_grGlideShutdown@0": () => { emit("shutdown"); return 0; },
+      "_grSstSelect@4": state("select", ["board"]),
+      "_grSstWinOpen@28": (sp) => {
+        const resolution = this.arg(sp, 1);
+        const dimensions = new Map([
+          [0x7, [640, 480]],
+          [0x8, [800, 600]],
+          [0xc, [1024, 768]],
+        ]).get(resolution) ?? [640, 480];
+        [this.glideWidth, this.glideHeight] = dimensions;
+        emit("open", {
+          window: this.arg(sp, 0),
+          resolution,
+          width: this.glideWidth,
+          height: this.glideHeight,
+          refresh: this.arg(sp, 2),
+          colorFormat: this.arg(sp, 3),
+          origin: this.arg(sp, 4),
+          colorBuffers: this.arg(sp, 5),
+          auxiliaryBuffers: this.arg(sp, 6),
+        });
+        return 1;
+      },
+      "_grSstWinClose@4": (sp) => { emit("close", { context: this.arg(sp, 0) }); return 1; },
+      "_grGet@12": (sp) => {
+        const parameter = this.arg(sp, 0);
+        const length = this.arg(sp, 1);
+        const output = this.arg(sp, 2);
+        if (!output || length < 4 || !getValues.has(parameter)) return 0;
+        this.view().setInt32(output, getValues.get(parameter), true);
+        return 4;
+      },
+      "_grGetString@4": (sp) => {
+        const parameter = this.arg(sp, 0);
+        const value = strings.get(parameter);
+        if (value === undefined) return 0;
+        if (!this.glideStrings.has(parameter)) this.glideStrings.set(parameter, this.allocCString(value));
+        return this.glideStrings.get(parameter);
+      },
+      "_grTexMinAddress@4": () => 0,
+      "_grTexMaxAddress@4": () => 16 * 1024 * 1024 - 512,
+      "_grVertexLayout@12": state("vertex-layout", ["parameter", "offset", "mode"]),
+      "_grTexDownloadMipMap@16": (sp) => {
+        const info = textureInfo(this.arg(sp, 3));
+        emit("texture-download", {
+          tmu: this.arg(sp, 0),
+          address: this.arg(sp, 1),
+          evenOdd: this.arg(sp, 2),
+          ...info,
+        });
+        return 0;
+      },
+      "_grTexSource@16": (sp) => {
+        const info = textureInfo(this.arg(sp, 3));
+        emit("texture-source", {
+          tmu: this.arg(sp, 0),
+          address: this.arg(sp, 1),
+          evenOdd: this.arg(sp, 2),
+          ...info,
+        });
+        return 0;
+      },
+      "_grTexDownloadTable@8": state("palette", ["table", "data"]),
+      "_grTexCombine@28": state("texture-combine", [
+        "tmu", "rgbFunction", "rgbFactor", "alphaFunction", "alphaFactor", "rgbInvert", "alphaInvert",
+      ]),
+      "_grTexFilterMode@12": state("texture-filter", ["tmu", "minification", "magnification"]),
+      "_grColorCombine@20": state("color-combine", ["function", "factor", "local", "other", "invert"]),
+      "_grAlphaCombine@20": state("alpha-combine", ["function", "factor", "local", "other", "invert"]),
+      "_grAlphaBlendFunction@16": state("alpha-blend", ["rgbSource", "rgbDestination", "alphaSource", "alphaDestination"]),
+      "_grConstantColorValue@4": state("constant-color", ["color"]),
+      "_grChromakeyMode@4": state("chroma-mode", ["mode"]),
+      "_grChromakeyValue@4": state("chroma-value", ["color"]),
+      "_grColorMask@8": state("color-mask", ["rgb", "alpha"]),
+      "_grDepthMask@4": state("depth-mask", ["enabled"]),
+      "_grDitherMode@4": state("dither", ["mode"]),
+      "_grCoordinateSpace@4": state("coordinate-space", ["mode"]),
+      "_grLoadGammaTable@16": state("gamma-table", ["entries", "red", "green", "blue"]),
+      "_guGammaCorrectionRGB@12": state("gamma", ["red", "green", "blue"]),
+      "_grDrawPoint@4": (sp) => draw("point", sp, { vertices: this.arg(sp, 0), count: 1, stride: 28 }),
+      "_grDrawLine@8": (sp) => draw("line", sp, {
+        vertices: [this.arg(sp, 0), this.arg(sp, 1)],
+        count: 2,
+        stride: 28,
+      }),
+      "_grDrawVertexArray@12": (sp) => draw("array", sp, {
+        mode: this.arg(sp, 0),
+        count: this.arg(sp, 1),
+        pointers: this.arg(sp, 2),
+        stride: 28,
+      }),
+      "_grDrawVertexArrayContiguous@16": (sp) => draw("contiguous", sp, {
+        mode: this.arg(sp, 0),
+        count: this.arg(sp, 1),
+        vertices: this.arg(sp, 2),
+        stride: this.arg(sp, 3),
+      }),
+      "_grBufferClear@12": state("clear", ["color", "alpha", "depth"]),
+      "_grBufferSwap@4": (sp) => {
+        this.completePresentation(this.glideWidth, this.glideHeight, () =>
+          emit("swap", { interval: this.arg(sp, 0), width: this.glideWidth, height: this.glideHeight })
+        );
+        return 0;
+      },
+      "_grFinish@0": () => { emit("finish"); return 0; },
+      "_grLfbLock@24": (sp) => {
+        const info = this.arg(sp, 5);
+        if (!info) return 0;
+        const required = this.glideWidth * this.glideHeight * 4;
+        if (!this.glideLfbPointer || this.glideLfbSize < required) {
+          this.glideLfbPointer = this.alloc(required, 16);
+          this.glideLfbSize = required;
+        }
+        this.glideLfbStride = this.glideWidth * 4;
+        const view = this.view();
+        view.setUint32(info + 4, this.glideLfbPointer, true);
+        view.setUint32(info + 8, this.glideLfbStride, true);
+        view.setUint32(info + 12, this.arg(sp, 2), true);
+        view.setUint32(info + 16, this.arg(sp, 3), true);
+        emit("lfb-lock", {
+          lockType: this.arg(sp, 0),
+          buffer: this.arg(sp, 1),
+          writeMode: this.arg(sp, 2),
+          origin: this.arg(sp, 3),
+          pixelPipeline: this.arg(sp, 4),
+          info,
+          data: this.glideLfbPointer,
+          stride: this.glideLfbStride,
+          width: this.glideWidth,
+          height: this.glideHeight,
+        });
+        return 1;
+      },
+      "_grLfbUnlock@8": (sp) => {
+        this.completePresentation(this.glideWidth, this.glideHeight, () => emit("lfb-unlock", {
+          lockType: this.arg(sp, 0),
+          buffer: this.arg(sp, 1),
+          data: this.glideLfbPointer,
+          stride: this.glideLfbStride,
+          width: this.glideWidth,
+          height: this.glideHeight,
+        }));
+        return 1;
+      },
     };
   }
 
@@ -1788,12 +2201,22 @@ export class Win32Runtime {
       "#1": (sp) => {
         const output = this.arg(sp, 1);
         if (!output) return 0x80070057;
+        if (!this.soundEnabled) {
+          this.view().setUint32(output, 0, true);
+          return 0x88780078;
+        }
         const object = this.createComObject(0, 11);
         this.directSoundObjects.add(object);
         this.view().setUint32(output, object, true);
         if (!this.directSoundCreatedReported) {
           this.directSoundCreatedReported = true;
-          this.events.push({ type: "direct-sound-created", object });
+          this.events.push({
+            type: "direct-sound-created",
+            output,
+            object,
+            vtable: this.view().getUint32(object, true),
+            result: 0,
+          });
         }
         return 0;
       },
@@ -1809,11 +2232,13 @@ export class Win32Runtime {
       "win32.crtdll.dll": this.crtdll(),
       "win32.version.dll": this.version(),
       "win32.gdi32.dll": this.gdi32(),
+      "win32.glide3x.dll": this.glide3x(),
       "win32.winmm.dll": this.winmm(),
       "win32.imm32.dll": this.imm32(),
       "win32.wsock32.dll": this.wsock32(),
       "win32.dsound.dll": this.dsound(),
     };
+    if (!this.diagnostics) return libraries;
     for (const [library, functions] of Object.entries(libraries)) {
       for (const [name, implementation] of Object.entries(functions)) {
         functions[name] = (...args) => {

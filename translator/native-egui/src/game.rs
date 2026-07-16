@@ -150,13 +150,11 @@ pub fn run(
 
     let set_fs_base = wt(instance.get_typed_func::<u32, ()>(&mut store, "d2_set_fs_base"))?;
     wt(set_fs_base.call(&mut store, FS_BASE))?;
+    let diagnostics = environment_u32("D2_DIAGNOSTICS")?.unwrap_or(0) != 0;
     let stop_trace_limit = environment_u32("D2_STOP_TRACE")?.filter(|limit| *limit != 0);
     let profile_trace = environment_u32("D2_PROFILE_TRACE")?.unwrap_or(0) != 0;
     let profile_round_pcs = environment_u32("D2_PROFILE_ROUND_PCS")?.unwrap_or(0) != 0;
-    if environment_u32("D2_DIAGNOSTICS")?.unwrap_or(0) != 0
-        || stop_trace_limit.is_some()
-        || profile_trace
-    {
+    if diagnostics || stop_trace_limit.is_some() || profile_trace {
         let set_diagnostics =
             wt(instance.get_typed_func::<u32, ()>(&mut store, "d2_set_diagnostics"))?;
         wt(set_diagnostics.call(&mut store, 1))?;
@@ -426,6 +424,39 @@ pub fn run(
             fps_sample_thread_slices = thread_slices;
             fps_status_counts.fill(0);
             round_pc_counts.clear();
+        }
+        if diagnostics && rounds % 100 == 0 {
+            let (next, last, esp) = {
+                let bytes = memory.data(&store);
+                (
+                    read_u32(bytes, context + 12).unwrap_or(0),
+                    read_u32(bytes, context + 16).unwrap_or(0),
+                    read_u32(bytes, context + 92).unwrap_or(0),
+                )
+            };
+            let (presentations, threads, sounds) = store.data().runtime.debug_counts();
+            let playing = store.data_mut().runtime.debug_sound_summary();
+            let thread_contexts = store.data().runtime.thread_contexts();
+            let thread_state = {
+                let bytes = memory.data(&store);
+                thread_contexts
+                    .into_iter()
+                    .map(|(handle, thread_context)| {
+                        let next = read_u32(bytes, thread_context + 12).unwrap_or(0);
+                        let last = read_u32(bytes, thread_context + 16).unwrap_or(0);
+                        let status = read_u32(bytes, thread_context + 24).unwrap_or(0);
+                        format!("{handle:#x}:{next:#010x}/{last:#010x}/s{status}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let report = format!(
+                "Debug checkpoint: round={rounds}, presentation={presentations}, result={result:#x}, \
+                 status={status}, next={next:#010x}, last={last:#010x}, esp={esp:#010x}, \
+                 threads={threads}[{thread_state}], sounds={sounds}, playing=[{playing}]"
+            );
+            eprintln!("{report}");
+            send(&event_tx, HostEvent::Log(report));
         }
         if store.data().runtime.quit_requested() {
             break;

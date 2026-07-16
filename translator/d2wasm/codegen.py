@@ -76,7 +76,6 @@ _OPTIONAL_FLAG_MNEMONICS = {
     "xor",
 }
 
-
 def host_thunk_pc(key: str) -> int:
     value = 0x811C9DC5
     for byte in key.lower().encode("utf-8"):
@@ -608,9 +607,16 @@ class CGenerator:
         if mnemonic in ("repne scasb", "repe scasb", "repz scasb"):
             repeat_while = "!zf" if mnemonic.startswith("repne") else "zf"
             return [f"do {{ if (!ecx) break; a = eax & 0xffu; b = load8(edi); result = (a - b) & 0xffu; flags_sub32(a, b, result, 8u); edi += df ? -1 : 1; ecx--; }} while (ecx && {repeat_while});"]
-        if mnemonic in ("repe cmpsb", "repz cmpsb", "repne cmpsb"):
+        if mnemonic in (
+            "repe cmpsb", "repz cmpsb", "repne cmpsb",
+            "repe cmpsw", "repz cmpsw", "repne cmpsw",
+            "repe cmpsd", "repz cmpsd", "repne cmpsd",
+        ):
             repeat_while = "!zf" if mnemonic.startswith("repne") else "zf"
-            return [f"do {{ if (!ecx) break; a = load8(esi); b = load8(edi); result = (a - b) & 0xffu; flags_sub32(a, b, result, 8u); esi += df ? -1 : 1; edi += df ? -1 : 1; ecx--; }} while (ecx && {repeat_while});"]
+            bits = 32 if mnemonic.endswith("d") else 16 if mnemonic.endswith("w") else 8
+            stride = bits // 8
+            mask = "0xffffffffu" if bits == 32 else f"0x{(1 << bits) - 1:x}u"
+            return [f"do {{ if (!ecx) break; a = load{bits}(esi); b = load{bits}(edi); result = (a - b) & {mask}; flags_sub32(a, b, result, {bits}u); esi += df ? -{stride} : {stride}; edi += df ? -{stride} : {stride}; ecx--; }} while (ecx && {repeat_while});"]
         if mnemonic == "fld" and len(operands) == 1:
             value = self._fpu_value(instruction, operands[0])
             return [f"fpu_push({value});"] if value else None
@@ -622,6 +628,10 @@ class CGenerator:
             return ["fpu_push(3.14159265358979323846264338327950288);"]
         if mnemonic == "fldln2":
             return ["fpu_push(0.693147180559945309417232121458176568);"]
+        if mnemonic == "fldl2e":
+            return ["fpu_push(1.44269504088896340735992468100189214);"]
+        if mnemonic == "fldlg2":
+            return ["fpu_push(0.301029995663981195213738894724493027);"]
         if mnemonic == "fild" and len(operands) == 1 and operands[0].type == X86_OP_MEM:
             address = self._address(instruction, operands[0])
             bits = int(operands[0].size) * 8
@@ -634,22 +644,27 @@ class CGenerator:
             if store is None:
                 return None
             return [store, "fpu_pop();"] if mnemonic == "fstp" else [store]
-        if mnemonic in ("fist", "fistp") and len(operands) == 1 and operands[0].type == X86_OP_MEM:
+        if mnemonic in ("fist", "fistp", "fisttp") and len(operands) == 1 and operands[0].type == X86_OP_MEM:
             address = self._address(instruction, operands[0])
             bits = int(operands[0].size) * 8
             if address is None or bits not in (16, 32, 64):
                 self._fail(instruction, "fist requires a 16-, 32-, or 64-bit integer destination")
                 return None
-            lines = [f"store{bits}({address}, (uint{bits}_t)(int{bits}_t)fpu_round(fpu[0]));"]
-            if mnemonic == "fistp":
+            value = "__builtin_trunc(fpu[0])" if mnemonic == "fisttp" else "fpu_round(fpu[0])"
+            lines = [f"store{bits}({address}, (uint{bits}_t)(int{bits}_t){value});"]
+            if mnemonic in ("fistp", "fisttp"):
                 lines.append("fpu_pop();")
             return lines
         if mnemonic == "fchs":
             return ["fpu[0] = -fpu[0];"]
+        if mnemonic == "fabs":
+            return ["if (fpu[0] < 0.0) fpu[0] = -fpu[0];"]
         if mnemonic == "fsin":
             return ["fpu[0] = fpu_sin(fpu[0]);"]
         if mnemonic == "fcos":
             return ["fpu[0] = fpu_cos(fpu[0]);"]
+        if mnemonic == "fsqrt" and not operands:
+            return ["fpu[0] = __builtin_sqrt(fpu[0]);"]
         if mnemonic == "fxch" and len(operands) in (1, 2):
             value = self._fpu_value(instruction, operands[-1])
             if value is None or not value.startswith("fpu["):
@@ -658,6 +673,12 @@ class CGenerator:
             return [f"fpu_swap({value[4:-1]});"]
         if mnemonic == "frndint":
             return ["fpu[0] = fpu_round(fpu[0]);"]
+        if mnemonic == "fyl2x" and not operands:
+            return ["fpu[1] = fpu[1] * fpu_log2(fpu[0]);", "fpu_pop();"]
+        if mnemonic == "f2xm1" and not operands:
+            return ["fpu[0] = fpu_exp2_fraction(fpu[0]) - 1.0;"]
+        if mnemonic == "fscale" and not operands:
+            return ["fpu[0] *= fpu_integer_pow(2.0, __builtin_trunc(fpu[1]));"]
         if mnemonic in ("fadd", "fsub", "fsubr", "fmul", "fdiv", "fdivr") and len(operands) == 1:
             value = self._fpu_value(instruction, operands[0])
             if value is None:
@@ -706,7 +727,7 @@ class CGenerator:
                 "fidiv": f"fpu[0] / {value}", "fidivr": f"{value} / fpu[0]",
             }[mnemonic]
             return [f"fpu[0] = {expression};"]
-        if mnemonic in ("fcomp", "fcom") and len(operands) == 1:
+        if mnemonic in ("fcomp", "fcom", "fucom") and len(operands) == 1:
             value = self._fpu_value(instruction, operands[0])
             if value is None:
                 return None
@@ -714,6 +735,19 @@ class CGenerator:
             if mnemonic == "fcomp":
                 lines.append("fpu_pop();")
             return lines
+        if mnemonic in ("ficom", "ficomp") and len(operands) == 1 and operands[0].type == X86_OP_MEM:
+            address = self._address(instruction, operands[0])
+            bits = int(operands[0].size) * 8
+            if address is None or bits not in (16, 32):
+                return None
+            lines = [f"fpu_compare(fpu[0], (double)(int{bits}_t)load{bits}({address}));"]
+            if mnemonic == "ficomp":
+                lines.append("fpu_pop();")
+            return lines
+        if mnemonic == "fcompp" and not operands:
+            return ["fpu_compare(fpu[0], fpu[1]);", "fpu_pop();", "fpu_pop();"]
+        if mnemonic == "ftst" and not operands:
+            return ["fpu_compare(fpu[0], 0.0);"]
         if mnemonic == "fnstsw" and len(operands) == 1:
             write = self._write(instruction, operands[0], "fpu_status")
             return [write] if write else None
@@ -1154,6 +1188,9 @@ static double fpu[8];
 static uint32_t fpu_depth;
 static uint16_t fpu_status;
 static uint16_t fpu_control;
+// Host imports can synchronously re-enter the module through
+// d2_request_yield().  Volatile makes that non-C re-entrancy visible to an
+// optimizing compiler at the dispatch boundary.
 static volatile uint32_t d2_yield_requested;
 
 typedef struct {
@@ -1227,6 +1264,39 @@ static inline double fpu_integer_pow(double base, double exponent) {
     remaining >>= 1u;
   }
   return signed_exponent < 0 ? 1.0 / result : result;
+}
+static inline double fpu_log2(double value) {
+  union { double value; uint64_t bits; } data = { value };
+  if ((data.bits << 1u) == 0) return -1.0 / 0.0;
+  if (data.bits >> 63u) return 0.0 / 0.0;
+  uint32_t biased_exponent = (uint32_t)((data.bits >> 52u) & 0x7ffu);
+  if (biased_exponent == 0x7ffu) return value;
+  int32_t exponent;
+  if (!biased_exponent) {
+    data.value *= 4503599627370496.0;
+    biased_exponent = (uint32_t)((data.bits >> 52u) & 0x7ffu);
+    exponent = (int32_t)biased_exponent - 1023 - 52;
+  } else {
+    exponent = (int32_t)biased_exponent - 1023;
+  }
+  data.bits = (data.bits & 0x000fffffffffffffull) | 0x3ff0000000000000ull;
+  double ratio = (data.value - 1.0) / (data.value + 1.0);
+  double ratio_squared = ratio * ratio;
+  double term = ratio, series = ratio;
+  for (uint32_t denominator = 3; denominator <= 39; denominator += 2) {
+    term *= ratio_squared;
+    series += term / (double)denominator;
+  }
+  return (double)exponent + 2.0 * series * 1.44269504088896340735992468100189214;
+}
+static inline double fpu_exp2_fraction(double value) {
+  double exponent = value * 0.693147180559945309417232121458176568;
+  double term = 1.0, result = 1.0;
+  for (uint32_t index = 1; index <= 20; index++) {
+    term *= exponent / (double)index;
+    result += term;
+  }
+  return result;
 }
 static inline double fpu_sin(double value) {
   const double pi = 3.14159265358979323846264338327950288;

@@ -391,6 +391,7 @@ pub struct Runtime {
     virtual_time: u32,
     clock_origin: Instant,
     direct_sound_objects: HashSet<u32>,
+    audio_output_enabled: bool,
     sound_buffers: HashMap<u32, SoundBuffer>,
     next_sound_id: u32,
     unknown_apis: HashSet<String>,
@@ -499,6 +500,9 @@ impl Runtime {
             virtual_time: 0,
             clock_origin: Instant::now(),
             direct_sound_objects: HashSet::new(),
+            audio_output_enabled: std::env::var("D2_DISABLE_SOUND")
+                .map(|value| !matches!(value.trim(), "1" | "true" | "yes"))
+                .unwrap_or(true),
             sound_buffers: HashMap::new(),
             next_sound_id: 1,
             unknown_apis: HashSet::new(),
@@ -690,6 +694,48 @@ impl Runtime {
 
     pub fn timing_counters(&self) -> (u64, u32) {
         (self.screen_presentations, self.virtual_time)
+    }
+
+    pub fn debug_counts(&self) -> (u64, usize, usize) {
+        let running_threads = self
+            .handles
+            .values()
+            .filter(|handle| matches!(handle, Handle::Thread(thread) if !thread.finished))
+            .count();
+        (
+            self.screen_presentations,
+            running_threads,
+            self.sound_buffers.len(),
+        )
+    }
+
+    pub fn debug_sound_summary(&mut self) -> String {
+        let now = self.clock_now();
+        let mut buffers = self
+            .sound_buffers
+            .values()
+            .filter(|buffer| buffer.playing)
+            .map(|buffer| {
+                let elapsed = now.wrapping_sub(buffer.play_started);
+                let bytes_per_second = u64::from(buffer.format.average_bytes_per_second)
+                    * u64::from(buffer.frequency.max(1))
+                    / u64::from(buffer.format.samples_per_second.max(1));
+                format!(
+                    "#{}:{}ms/{:.0}ms flags={:#x} rate={}",
+                    buffer.id,
+                    elapsed,
+                    f64::from(buffer.size) * 1_000.0 / bytes_per_second.max(1) as f64,
+                    buffer.play_flags,
+                    bytes_per_second
+                )
+            })
+            .collect::<Vec<_>>();
+        buffers.sort();
+        if buffers.is_empty() {
+            String::from("none")
+        } else {
+            buffers.join(", ")
+        }
     }
 
     pub fn prepare_invoke(

@@ -98,6 +98,24 @@ impl Runtime {
         write_u16(memory, pointer + 16, 0)
     }
 
+    fn sound_bytes_per_second(buffer: &SoundBuffer) -> u64 {
+        let base_rate = u64::from(buffer.format.samples_per_second.max(1));
+        (u64::from(buffer.format.average_bytes_per_second) * u64::from(buffer.frequency.max(1))
+            / base_rate)
+            .max(1)
+    }
+
+    fn refresh_sound_playback(&mut self, object: u32, now: u32) {
+        let buffer = self.sound_buffers.get_mut(&object).expect("checked above");
+        if !buffer.playing || buffer.play_flags & 1 != 0 || buffer.size == 0 {
+            return;
+        }
+        let elapsed = u64::from(now.wrapping_sub(buffer.play_started));
+        if elapsed * Self::sound_bytes_per_second(buffer) >= u64::from(buffer.size) * 1_000 {
+            buffer.playing = false;
+        }
+    }
+
     fn dispatch_direct_sound_object(
         &mut self,
         method: u32,
@@ -203,17 +221,22 @@ impl Runtime {
             4 => {
                 let now = self.clock_now();
                 let buffer = &self.sound_buffers[&object];
-                let elapsed = if buffer.playing {
+                let elapsed = u64::from(if buffer.playing {
                     now.wrapping_sub(buffer.play_started)
                 } else {
                     0
-                };
-                let cursor = if buffer.size != 0 && buffer.format.average_bytes_per_second != 0 {
-                    ((u64::from(elapsed) * u64::from(buffer.format.average_bytes_per_second)
-                        / 1000)
-                        % u64::from(buffer.size)) as u32
-                } else {
+                });
+                let played = elapsed * Self::sound_bytes_per_second(buffer) / 1_000;
+                let size = buffer.size;
+                let looping = buffer.play_flags & 1 != 0;
+                let block_align = buffer.format.block_align;
+                self.refresh_sound_playback(object, now);
+                let cursor = if size == 0 {
                     0
+                } else if looping {
+                    (played % u64::from(size)) as u32
+                } else {
+                    played.min(u64::from(size - 1)) as u32
                 };
                 let play = arg(memory, sp, 1);
                 let write = arg(memory, sp, 2);
@@ -221,14 +244,14 @@ impl Runtime {
                     write_u32(memory, play, cursor)?;
                 }
                 if write != 0 {
-                    let ahead = u32::from(buffer.format.block_align) * 4;
+                    let ahead = u32::from(block_align) * 4;
                     write_u32(
                         memory,
                         write,
-                        if buffer.size == 0 {
+                        if size == 0 {
                             0
                         } else {
-                            (cursor + ahead) % buffer.size
+                            (cursor + ahead) % size
                         },
                     )?;
                 }
@@ -246,6 +269,10 @@ impl Runtime {
                 }
             }
             6..=9 => {
+                if method == 9 {
+                    let now = self.clock_now();
+                    self.refresh_sound_playback(object, now);
+                }
                 let output = arg(memory, sp, 1);
                 if output != 0 {
                     let buffer = &self.sound_buffers[&object];
@@ -336,9 +363,11 @@ impl Runtime {
             18 => {
                 let buffer = self.sound_buffers.get_mut(&object).expect("checked above");
                 buffer.playing = false;
-                let _ = self
-                    .event_tx
-                    .try_send(HostEvent::AudioStop { id: buffer.id });
+                if self.audio_output_enabled {
+                    let _ = self
+                        .event_tx
+                        .try_send(HostEvent::AudioStop { id: buffer.id });
+                }
             }
             _ => {}
         }
@@ -346,6 +375,9 @@ impl Runtime {
     }
 
     fn emit_sound(&self, object: u32, memory: &[u8]) -> Result<()> {
+        if !self.audio_output_enabled {
+            return Ok(());
+        }
         let buffer = &self.sound_buffers[&object];
         if buffer.primary || buffer.bytes == 0 || buffer.size == 0 || buffer.format.format_tag != 1
         {

@@ -123,16 +123,19 @@ Build the complete gameplay artifact:
   --roots-file diablo-roots.json \
   --emit-partial \
   --api-spec api-spec.json \
-  --opt-level 0
+  --opt-level 1
 ```
 
 An exit status of 2 is expected for this `--emit-partial` build: explicit
 diagnostic sites remain in unexercised branches, while `linked.wasm` is still
 successfully generated. Any other nonzero status is a build failure.
 
-`-O0` is intentional for this artifact. It preserves page-sized translated
-functions instead of letting LLVM fold the dispatcher into a function larger
-than V8's per-function limit.
+Optimized builds retain page-sized translated functions and use wrapping,
+alias-safe compiler flags so LLVM cannot change lifted x86 memory/arithmetic
+semantics. Host-triggered cooperative yields are volatile because JavaScript
+imports can synchronously re-enter the Wasm module. This keeps the linked
+module within V8's per-function limit while substantially reducing dispatcher
+overhead and artifact size.
 
 ### 5. Run the deterministic gameplay path
 
@@ -227,9 +230,12 @@ input is ignored during replay except for closing the window.
 ## Chrome host
 
 The browser harness runs the same linked Wasm and JavaScript Win32 boundary in
-a module Web Worker, keeps an 800x600 `OffscreenCanvas` while scaling the
-640x480 in-game renderer, forwards mouse, wheel, character, and keyboard input,
-and plays guest DirectSound PCM buffers through Web Audio.
+a module Web Worker. It uploads the guest's 32-bit software framebuffer to a
+WebGL2 texture (with a Canvas2D fallback), keeps an 800x600 `OffscreenCanvas`
+while scaling the 640x480 in-game renderer, and forwards mouse, wheel,
+character, and keyboard input. Guest DirectSound ring buffers are streamed to
+Web Audio, including live lock/unlock writes, playback position, volume, pan,
+frequency, and stop updates.
 Game data and initial saves are fetched into a synchronous in-memory filesystem
 before execution begins; browser writes are currently session-local.
 
@@ -244,7 +250,7 @@ data transfers roughly 180 MB on the local connection. The optional autoplay
 checkbox selects an existing saved character when one is available, otherwise
 it follows the deterministic Barbarian character-creation path.
 
-The server defaults to `http://127.0.0.1:8080/` and accepts explicit input
+The server defaults to `http://127.0.0.1:8089/` and accepts explicit input
 locations when the build lives elsewhere:
 
 ```sh
@@ -257,8 +263,10 @@ locations when the build lives elsewhere:
 ```
 
 Chrome requires `OffscreenCanvas`; current Chromium/Chrome releases provide it.
-The included server also supplies the cross-origin isolation and Wasm MIME
-headers expected by the worker.
+WebGL2 accelerates presentation of D2Gdi's software output; this does not yet
+implement the guest DirectDraw/Direct3D COM or Glide driver interfaces. The
+included server also supplies the cross-origin isolation and Wasm MIME headers
+expected by the worker.
 
 ## SQLite lifted-code debug database
 

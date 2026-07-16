@@ -105,10 +105,10 @@ let instance;
 let hostCalls = 0;
 const imports = {
   "win32.test.dll": {
-    HostAdd(stackPointer) {
-      const view = new DataView(memory.buffer);
-      hostCalls++;
-      if (hostCalls === 2) instance.exports.d2_request_yield();
+      HostAdd(stackPointer) {
+        const view = new DataView(memory.buffer);
+        hostCalls++;
+        if (hostCalls === 2) instance.exports.d2_request_yield();
       return view.getUint32(stackPointer, true) + view.getUint32(stackPointer + 4, true);
     },
   },
