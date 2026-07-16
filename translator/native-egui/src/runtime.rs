@@ -9,6 +9,7 @@ use std::{
     fs::File,
     path::{Component, Path, PathBuf},
     sync::mpsc::{Receiver, SyncSender, TryRecvError},
+    time::Instant,
 };
 
 const SCREEN_WIDTH: usize = 800;
@@ -192,6 +193,8 @@ pub struct Runtime {
     auto_keys: VecDeque<(u32, u64)>,
     show_cursor_count: i32,
     virtual_time: u32,
+    clock_origin: Instant,
+    clock_offset: u32,
     unknown_apis: HashSet<String>,
     event_tx: SyncSender<HostEvent>,
     input_rx: Receiver<InputEvent>,
@@ -290,6 +293,8 @@ impl Runtime {
             auto_keys,
             show_cursor_count: 0,
             virtual_time: 0,
+            clock_origin: Instant::now(),
+            clock_offset: 0,
             unknown_apis: HashSet::new(),
             event_tx,
             input_rx,
@@ -390,7 +395,7 @@ impl Runtime {
                 }
                 0x8878_0078
             }
-            "win32.winmm.dll" => self.tick(16),
+            "win32.winmm.dll" => self.clock_now(),
             _ => self.unknown(library, name, 0),
         };
         Ok(DispatchResult::Value(value))
@@ -406,8 +411,20 @@ impl Runtime {
         fallback
     }
 
-    fn tick(&mut self, delta: u32) -> u32 {
-        self.virtual_time = self.virtual_time.wrapping_add(delta);
+    fn clock_now(&mut self) -> u32 {
+        let elapsed = self
+            .clock_origin
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32;
+        self.virtual_time = self.clock_offset.wrapping_add(elapsed);
+        self.virtual_time
+    }
+
+    fn advance_clock(&mut self, delta: u32) -> u32 {
+        self.clock_offset = self.clock_now().wrapping_add(delta);
+        self.clock_origin = Instant::now();
+        self.virtual_time = self.clock_offset;
         self.virtual_time
     }
 
@@ -809,9 +826,10 @@ impl Runtime {
                 rgba[output + 3] = 0xff;
             }
         }
+        let virtual_time = self.clock_now();
         if let Err(error) = self.gameplay.checkpoint(
             self.screen_presentations,
-            self.virtual_time,
+            virtual_time,
             width,
             height,
             &rgba,
