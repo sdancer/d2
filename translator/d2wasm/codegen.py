@@ -6,6 +6,7 @@ import re
 import subprocess
 from typing import Any
 
+from capstone import x86_const
 from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 
 from .cfg import Block
@@ -26,6 +27,54 @@ CONTROL_TERMINATORS = {
 }
 
 HOST_THUNK_BASE = 0xE0000000
+
+_MODELED_EFLAG_ACCESS = (
+    (
+        x86_const.X86_EFLAGS_TEST_CF,
+        x86_const.X86_EFLAGS_MODIFY_CF
+        | x86_const.X86_EFLAGS_RESET_CF
+        | x86_const.X86_EFLAGS_SET_CF,
+    ),
+    (
+        x86_const.X86_EFLAGS_TEST_PF,
+        x86_const.X86_EFLAGS_MODIFY_PF
+        | x86_const.X86_EFLAGS_RESET_PF
+        | x86_const.X86_EFLAGS_SET_PF,
+    ),
+    (
+        x86_const.X86_EFLAGS_TEST_ZF,
+        x86_const.X86_EFLAGS_MODIFY_ZF
+        | x86_const.X86_EFLAGS_RESET_ZF
+        | x86_const.X86_EFLAGS_SET_ZF,
+    ),
+    (
+        x86_const.X86_EFLAGS_TEST_SF,
+        x86_const.X86_EFLAGS_MODIFY_SF
+        | x86_const.X86_EFLAGS_RESET_SF
+        | x86_const.X86_EFLAGS_SET_SF,
+    ),
+    (
+        x86_const.X86_EFLAGS_TEST_OF,
+        x86_const.X86_EFLAGS_MODIFY_OF
+        | x86_const.X86_EFLAGS_RESET_OF
+        | x86_const.X86_EFLAGS_SET_OF,
+    ),
+)
+_ALL_MODELED_EFLAGS = (1 << len(_MODELED_EFLAG_ACCESS)) - 1
+_OPTIONAL_FLAG_MNEMONICS = {
+    "adc",
+    "add",
+    "and",
+    "cmp",
+    "dec",
+    "inc",
+    "neg",
+    "or",
+    "sbb",
+    "sub",
+    "test",
+    "xor",
+}
 
 
 def host_thunk_pc(key: str) -> int:
@@ -250,7 +299,13 @@ class CGenerator:
         self._fail(instruction, "unsupported x87 destination")
         return None
 
-    def _binary(self, instruction: Any, operator: str, flags: str | None = None) -> list[str] | None:
+    def _binary(
+        self,
+        instruction: Any,
+        operator: str,
+        flags: str | None = None,
+        emit_flags: bool = True,
+    ) -> list[str] | None:
         if len(instruction.operands) != 2:
             self._fail(instruction, "expected two operands")
             return None
@@ -263,7 +318,7 @@ class CGenerator:
             self._fail(instruction, "arithmetic requires equal 8-, 16-, or 32-bit operands")
             return None
         lines = [f"a = {left[0]};", f"b = {right[0]};", f"result = (a {operator} b) & 0x{_mask(bits):x}u;"]
-        if flags:
+        if flags and emit_flags:
             if flags == "logic32":
                 lines.append(f"flags_logic32(result, {bits}u);")
             else:
@@ -274,7 +329,9 @@ class CGenerator:
         lines.append(write)
         return lines
 
-    def lift_instruction(self, instruction: Any) -> list[str] | None:
+    def lift_instruction(
+        self, instruction: Any, emit_flags: bool = True
+    ) -> list[str] | None:
         mnemonic = instruction.mnemonic
         operands = instruction.operands
         if mnemonic == "nop":
@@ -299,15 +356,15 @@ class CGenerator:
             write = self._write(instruction, operands[0], address or "0") if address else None
             return [write] if write else None
         if mnemonic == "add":
-            return self._binary(instruction, "+", "add32")
+            return self._binary(instruction, "+", "add32", emit_flags)
         if mnemonic == "sub":
-            return self._binary(instruction, "-", "sub32")
+            return self._binary(instruction, "-", "sub32", emit_flags)
         if mnemonic == "xor":
-            return self._binary(instruction, "^", "logic32")
+            return self._binary(instruction, "^", "logic32", emit_flags)
         if mnemonic == "and":
-            return self._binary(instruction, "&", "logic32")
+            return self._binary(instruction, "&", "logic32", emit_flags)
         if mnemonic == "or":
-            return self._binary(instruction, "|", "logic32")
+            return self._binary(instruction, "|", "logic32", emit_flags)
         if mnemonic in ("adc", "sbb") and len(operands) == 2:
             left = self._read(instruction, operands[0])
             right = self._read(instruction, operands[1])
@@ -320,7 +377,15 @@ class CGenerator:
                 return None
             helper = "flags_adc" if mnemonic == "adc" else "flags_sbb"
             operator = "+" if mnemonic == "adc" else "-"
-            return [f"a = {left[0]};", f"b = {right[0]};", "old_cf = cf;", f"result = (a {operator} b {operator} old_cf) & 0x{_mask(bits):x}u;", f"{helper}(a, b, result, old_cf, {bits}u);", write]
+            lines = [
+                f"a = {left[0]};",
+                f"b = {right[0]};",
+                "old_cf = cf;",
+                f"result = (a {operator} b {operator} old_cf) & 0x{_mask(bits):x}u;",
+            ]
+            if emit_flags:
+                lines.append(f"{helper}(a, b, result, old_cf, {bits}u);")
+            return [*lines, write]
         if mnemonic in ("inc", "dec") and len(operands) == 1:
             value = self._read(instruction, operands[0])
             if value is None or value[1] not in (8, 16, 32):
@@ -332,7 +397,13 @@ class CGenerator:
             write = self._write(instruction, operands[0], "result")
             if write is None:
                 return None
-            return [f"a = {value[0]};", f"result = (a {operator} 1u) & 0x{_mask(bits):x}u;", f"{flag_fn}(a, result, {bits}u);", write]
+            lines = [
+                f"a = {value[0]};",
+                f"result = (a {operator} 1u) & 0x{_mask(bits):x}u;",
+            ]
+            if emit_flags:
+                lines.append(f"{flag_fn}(a, result, {bits}u);")
+            return [*lines, write]
         if mnemonic in ("cmp", "test") and len(operands) == 2:
             left = self._read(instruction, operands[0])
             right = self._read(instruction, operands[1])
@@ -340,6 +411,8 @@ class CGenerator:
                 self._fail(instruction, f"{mnemonic} requires equal 8-, 16-, or 32-bit operands")
                 return None
             bits = left[1]
+            if not emit_flags:
+                return []
             operator = "-" if mnemonic == "cmp" else "&"
             flag_fn = "flags_sub32" if mnemonic == "cmp" else "flags_logic32"
             return [f"a = {left[0]};", f"b = {right[0]};", f"result = (a {operator} b) & 0x{_mask(bits):x}u;", f"{flag_fn}(a, b, result, {bits}u);" if mnemonic == "cmp" else f"{flag_fn}(result, {bits}u);"]
@@ -354,7 +427,15 @@ class CGenerator:
                 write = self._write(instruction, operands[0], expression)
                 return [write] if write else None
             write = self._write(instruction, operands[0], "result")
-            return [f"a = {value[0]};", f"result = (0u - a) & 0x{_mask(bits):x}u;", f"flags_sub32(0u, a, result, {bits}u);", write] if write else None
+            if write is None:
+                return None
+            lines = [
+                f"a = {value[0]};",
+                f"result = (0u - a) & 0x{_mask(bits):x}u;",
+            ]
+            if emit_flags:
+                lines.append(f"flags_sub32(0u, a, result, {bits}u);")
+            return [*lines, write]
         if mnemonic in ("shl", "sal", "shr", "sar") and len(operands) == 2:
             value = self._read(instruction, operands[0])
             count = self._read(instruction, operands[1])
@@ -726,11 +807,40 @@ class CGenerator:
             ]
         return None
 
+    @staticmethod
+    def _modeled_eflag_access(instruction: Any) -> tuple[int, int]:
+        eflags = int(getattr(instruction, "eflags", 0))
+        reads = 0
+        writes = 0
+        for index, (read_mask, write_mask) in enumerate(_MODELED_EFLAG_ACCESS):
+            flag = 1 << index
+            if eflags & read_mask:
+                reads |= flag
+            if instruction.mnemonic in _OPTIONAL_FLAG_MNEMONICS and eflags & write_mask:
+                writes |= flag
+        return reads, writes
+
+    def _block_flag_requirements(self, block: Block) -> dict[int, bool]:
+        # Flags crossing a basic-block boundary remain conservatively live.
+        # Within a block, however, an unconditional arithmetic writer can
+        # prove earlier flag results dead before any instruction observes them.
+        live = _ALL_MODELED_EFLAGS
+        requirements: dict[int, bool] = {}
+        for instruction in reversed(block.instructions):
+            reads, writes = self._modeled_eflag_access(instruction)
+            requirements[int(instruction.address)] = not writes or bool(writes & live)
+            live = (live & ~writes) | reads
+        return requirements
+
     def _emit_block(self, block: Block) -> list[str]:
         lines = [f"case 0x{self._pc(block.rva):08x}u:"]
         body = block.instructions[:-1] if block.terminator in CONTROL_TERMINATORS else block.instructions
+        flag_requirements = self._block_flag_requirements(block)
         for instruction in body:
-            lifted = self.lift_instruction(instruction)
+            lifted = self.lift_instruction(
+                instruction,
+                emit_flags=flag_requirements.get(int(instruction.address), True),
+            )
             if lifted is None:
                 lines.extend(["  d2_status = D2_STATUS_UNSUPPORTED;", "  return D2_ACTION_RETURN;"])
                 return lines

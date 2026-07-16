@@ -129,6 +129,32 @@ _entry:
         cmpl $77, %ecx
         jne _failed
 
+        # A dead INC flag result must not hide the carry produced by the ADD
+        # before it. ADC consumes that preserved carry even when its own flags
+        # are overwritten by the following comparison.
+        movl $-1, %eax
+        xorl %edx, %edx
+        xorl %ecx, %ecx
+        addl $1, %eax
+        incl %ecx
+        adcl $0, %edx
+        movl $121, %ebx
+        cmpl $1, %edx
+        jne _failed
+
+        # These two arithmetic flag results are dead inside this basic block:
+        # each is overwritten before the conditional comparison observes flags.
+        movl $1, %ecx
+        movl $10, %edx
+        incl %ecx
+        addl $12, %edx
+        movl $122, %ebx
+        cmpl $2, %ecx
+        jne _failed
+        movl $123, %ebx
+        cmpl $22, %edx
+        jne _failed
+
         rdtsc
         movl %eax, %ecx
         rdtsc
