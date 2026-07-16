@@ -233,6 +233,7 @@ pub fn run(
     let (mut fps_sample_presentations, mut fps_sample_virtual_ms) =
         store.data().runtime.timing_counters();
     let mut fps_sample_round = 0u64;
+    let mut fps_status_counts = [0u64; 7];
     let mut rounds = 0u64;
     let mut reported_watch_contexts = HashSet::new();
     loop {
@@ -242,6 +243,11 @@ pub fn run(
         ))?;
         rounds += 1;
         let status = wt(context_status.call(&mut store, context))?;
+        let status_index = usize::try_from(status)
+            .ok()
+            .filter(|index| *index < 6)
+            .unwrap_or(6);
+        fps_status_counts[status_index] += 1;
         let finished = wt(context_finished.call(&mut store, context))? != 0;
         if watch_pc.is_some() {
             let mut contexts = vec![(1, context)];
@@ -312,11 +318,19 @@ pub fn run(
             let report = format!(
                 "FPS sample: wall={elapsed:.3}s, presentations={presentation_delta}, \
                  fps={:.2}, rounds={round_delta}, rounds_per_second={:.2}, \
+                 statuses=[ok:{},fuel:{},missing:{},unsupported:{},trap:{},yield:{},other:{}], \
                  virtual_ms={virtual_delta}, clock_rate={:.2}x, \
                  main={next_pc:#010x}/{last_pc:#010x}, threads=[{thread_state}], \
                  memory=[{memory_state}]",
                 presentation_delta as f64 / elapsed,
                 round_delta as f64 / elapsed,
+                fps_status_counts[0],
+                fps_status_counts[1],
+                fps_status_counts[2],
+                fps_status_counts[3],
+                fps_status_counts[4],
+                fps_status_counts[5],
+                fps_status_counts[6],
                 f64::from(virtual_delta) / (elapsed * 1_000.0),
             );
             eprintln!("{report}");
@@ -333,6 +347,7 @@ pub fn run(
             fps_sample_presentations = presentations;
             fps_sample_virtual_ms = virtual_ms;
             fps_sample_round = rounds;
+            fps_status_counts.fill(0);
         }
         if store.data().runtime.quit_requested() {
             break;
