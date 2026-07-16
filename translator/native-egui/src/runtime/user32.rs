@@ -303,12 +303,12 @@ impl Runtime {
         Ok(DispatchResult::Value(value))
     }
 
-    fn write_message(&self, memory: &mut [u8], pointer: u32, message: &Message) -> Result<()> {
+    fn write_message(&mut self, memory: &mut [u8], pointer: u32, message: &Message) -> Result<()> {
         write_u32(memory, pointer, message.hwnd)?;
         write_u32(memory, pointer + 4, message.message)?;
         write_u32(memory, pointer + 8, message.w_param)?;
         write_u32(memory, pointer + 12, message.l_param)?;
-        write_u32(memory, pointer + 16, self.virtual_time)?;
+        write_u32(memory, pointer + 16, self.clock_now())?;
         write_i32(memory, pointer + 20, self.cursor_x)?;
         write_i32(memory, pointer + 24, self.cursor_y)?;
         Ok(())

@@ -3,6 +3,8 @@ pub enum HostEvent {
     Frame {
         width: usize,
         height: usize,
+        input_width: usize,
+        input_height: usize,
         rgba: Vec<u8>,
         presentation: u64,
     },

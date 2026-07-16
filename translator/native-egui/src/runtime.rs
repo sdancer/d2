@@ -749,7 +749,7 @@ impl Runtime {
         });
     }
 
-    fn present(&mut self, memory: &[u8], bitmap: &Bitmap) {
+    fn present(&mut self, memory: &[u8], bitmap: &Bitmap, width: usize, height: usize) {
         self.screen_presentations += 1;
         self.poll_input();
         if self.quit_requested {
@@ -812,17 +812,25 @@ impl Runtime {
                 self.screen_presentations
             ));
         }
-        let width = bitmap.width.max(1) as usize;
-        let height = bitmap.height.max(1) as usize;
+        let source_width = width.max(1).min(bitmap.width.max(1) as usize);
+        let source_height = height.max(1).min(bitmap.height.max(1) as usize);
+        let width = SCREEN_WIDTH;
+        let height = SCREEN_HEIGHT;
         let Some(source) = memory.get(bitmap.bits as usize..bitmap.bits as usize + bitmap.size)
         else {
             return;
         };
         let mut rgba = vec![0; width * height * 4];
         for y in 0..height {
-            let source_y = if bitmap.top_down { y } else { height - 1 - y };
+            let scaled_y = y * source_height / height;
+            let source_y = if bitmap.top_down {
+                scaled_y
+            } else {
+                bitmap.height as usize - 1 - scaled_y
+            };
             for x in 0..width {
-                let input = source_y * bitmap.stride + x * 4;
+                let scaled_x = x * source_width / width;
+                let input = source_y * bitmap.stride + scaled_x * 4;
                 let output = (y * width + x) * 4;
                 rgba[output] = source[input + 2];
                 rgba[output + 1] = source[input + 1];
@@ -843,6 +851,8 @@ impl Runtime {
         let _ = self.event_tx.try_send(HostEvent::Frame {
             width,
             height,
+            input_width: source_width,
+            input_height: source_height,
             rgba,
             presentation: self.screen_presentations,
         });

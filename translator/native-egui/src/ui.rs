@@ -7,6 +7,7 @@ pub struct D2App {
     input: Sender<InputEvent>,
     texture: Option<egui::TextureHandle>,
     framebuffer_size: [usize; 2],
+    input_size: [usize; 2],
     presentation: u64,
     status: String,
     logs: Vec<String>,
@@ -19,6 +20,7 @@ impl D2App {
             input,
             texture: None,
             framebuffer_size: [800, 600],
+            input_size: [800, 600],
             presentation: 0,
             status: String::from("Starting native host…"),
             logs: Vec::new(),
@@ -31,6 +33,8 @@ impl D2App {
                 HostEvent::Frame {
                     width,
                     height,
+                    input_width,
+                    input_height,
                     rgba,
                     presentation,
                 } => {
@@ -45,6 +49,7 @@ impl D2App {
                         ));
                     }
                     self.framebuffer_size = [width, height];
+                    self.input_size = [input_width, input_height];
                     self.presentation = presentation;
                     context.request_repaint();
                 }
@@ -64,10 +69,7 @@ impl D2App {
     }
 
     fn forward_input(&self, context: &egui::Context, screen: egui::Rect) {
-        let framebuffer = egui::vec2(
-            self.framebuffer_size[0] as f32,
-            self.framebuffer_size[1] as f32,
-        );
+        let framebuffer = egui::vec2(self.input_size[0] as f32, self.input_size[1] as f32);
         let map = |position: egui::Pos2| -> Option<(i32, i32)> {
             if !screen.contains(position) {
                 return None;
