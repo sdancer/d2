@@ -124,6 +124,7 @@ pub fn run(
     wt(set_fs_base.call(&mut store, FS_BASE))?;
     let stop_trace_limit = environment_u32("D2_STOP_TRACE")?.filter(|limit| *limit != 0);
     let profile_trace = environment_u32("D2_PROFILE_TRACE")?.unwrap_or(0) != 0;
+    let profile_round_pcs = environment_u32("D2_PROFILE_ROUND_PCS")?.unwrap_or(0) != 0;
     if environment_u32("D2_DIAGNOSTICS")?.unwrap_or(0) != 0
         || stop_trace_limit.is_some()
         || profile_trace
@@ -233,21 +234,41 @@ pub fn run(
     let (mut fps_sample_presentations, mut fps_sample_virtual_ms) =
         store.data().runtime.timing_counters();
     let mut fps_sample_round = 0u64;
+    let mut fps_sample_blocks = 0u64;
+    let mut fps_sample_count_hits = 0u32;
     let mut fps_status_counts = [0u64; 7];
+    let mut round_pc_counts = HashMap::<u32, u64>::new();
+    let mut profile_fuel_state = 0x6d2b_79f5u32;
     let mut rounds = 0u64;
+    let mut executed_blocks = 0u64;
     let mut reported_watch_contexts = HashSet::new();
     loop {
+        let round_fuel = if profile_round_pcs {
+            profile_fuel_state = profile_fuel_state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
+            FUEL_PER_ROUND / 2 + profile_fuel_state % (FUEL_PER_ROUND + 1)
+        } else {
+            FUEL_PER_ROUND
+        };
         let result = wt(run_context.call(
             &mut store,
-            (context, manifest.entry_va, STACK_TOP, FUEL_PER_ROUND),
+            (context, manifest.entry_va, STACK_TOP, round_fuel),
         ))?;
         rounds += 1;
         let status = wt(context_status.call(&mut store, context))?;
+        if status == 1 {
+            executed_blocks += u64::from(round_fuel);
+        }
         let status_index = usize::try_from(status)
             .ok()
             .filter(|index| *index < 6)
             .unwrap_or(6);
         fps_status_counts[status_index] += 1;
+        if profile_round_pcs {
+            let next_pc = read_u32(memory.data(&store), context + 12).unwrap_or(0);
+            *round_pc_counts.entry(next_pc).or_default() += 1;
+        }
         let finished = wt(context_finished.call(&mut store, context))? != 0;
         if watch_pc.is_some() {
             let mut contexts = vec![(1, context)];
@@ -280,6 +301,16 @@ pub fn run(
             let presentation_delta = presentations.saturating_sub(fps_sample_presentations);
             let virtual_delta = virtual_ms.wrapping_sub(fps_sample_virtual_ms);
             let round_delta = rounds - fps_sample_round;
+            let block_delta = executed_blocks - fps_sample_blocks;
+            let count_state =
+                if let (Some(address), Some(counter)) = (count_pc, count_hits.as_ref()) {
+                    let hits = wt(counter.call(&mut store, ()))?;
+                    let delta = hits.wrapping_sub(fps_sample_count_hits);
+                    fps_sample_count_hits = hits;
+                    format!("{address:#010x}:{delta}/{hits}")
+                } else {
+                    String::new()
+                };
             let thread_contexts = store.data().runtime.thread_contexts();
             let (next_pc, last_pc, thread_state, memory_state) = {
                 let bytes = memory.data(&store);
@@ -318,12 +349,14 @@ pub fn run(
             let report = format!(
                 "FPS sample: wall={elapsed:.3}s, presentations={presentation_delta}, \
                  fps={:.2}, rounds={round_delta}, rounds_per_second={:.2}, \
+                 blocks={block_delta}, blocks_per_second={:.2}, \
                  statuses=[ok:{},fuel:{},missing:{},unsupported:{},trap:{},yield:{},other:{}], \
                  virtual_ms={virtual_delta}, clock_rate={:.2}x, \
                  main={next_pc:#010x}/{last_pc:#010x}, threads=[{thread_state}], \
-                 memory=[{memory_state}]",
+                 memory=[{memory_state}], count=[{count_state}]",
                 presentation_delta as f64 / elapsed,
                 round_delta as f64 / elapsed,
+                block_delta as f64 / elapsed,
                 fps_status_counts[0],
                 fps_status_counts[1],
                 fps_status_counts[2],
@@ -343,11 +376,21 @@ pub fn run(
                     HostEvent::Log(format!("Retained translated trace profile: {profile}")),
                 );
             }
+            if profile_round_pcs {
+                let profile = format_round_pc_profile(&round_pc_counts);
+                eprintln!("Round endpoint profile: {profile}");
+                send(
+                    &event_tx,
+                    HostEvent::Log(format!("Round endpoint profile: {profile}")),
+                );
+            }
             fps_sample_started = Instant::now();
             fps_sample_presentations = presentations;
             fps_sample_virtual_ms = virtual_ms;
             fps_sample_round = rounds;
+            fps_sample_blocks = executed_blocks;
             fps_status_counts.fill(0);
+            round_pc_counts.clear();
         }
         if store.data().runtime.quit_requested() {
             break;
@@ -402,6 +445,42 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+fn format_round_pc_profile(counts: &HashMap<u32, u64>) -> String {
+    let mut exact = counts
+        .iter()
+        .map(|(pc, count)| (*pc, *count))
+        .collect::<Vec<_>>();
+    exact.sort_unstable_by(|(left_pc, left_count), (right_pc, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_pc.cmp(right_pc))
+    });
+    let exact = exact
+        .into_iter()
+        .take(12)
+        .map(|(pc, count)| format!("{pc:#010x}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut pages = HashMap::<u32, u64>::new();
+    for (pc, count) in counts {
+        *pages.entry(*pc & !0xfff).or_default() += count;
+    }
+    let mut pages = pages.into_iter().collect::<Vec<_>>();
+    pages.sort_unstable_by(|(left_pc, left_count), (right_pc, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_pc.cmp(right_pc))
+    });
+    let pages = pages
+        .into_iter()
+        .take(8)
+        .map(|(pc, count)| format!("{pc:#010x}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("exact=[{exact}], pages=[{pages}]")
 }
 
 fn capture_retained_trace_profile(
