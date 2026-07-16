@@ -750,29 +750,29 @@ class CGenerator:
                 "  d2_next_pc = load32(esp);",
                 f"  esp += {4 + adjustment}u;",
                 "  if (d2_next_pc == D2_RETURN_SENTINEL) { d2_status = D2_STATUS_OK; return D2_ACTION_RETURN; }",
-                "  return D2_ACTION_CONTINUE;",
+                "  D2_CHAIN();",
             ]
         elif block.terminator == "call":
             target, fallthrough = block.successors
-            lines += ["  esp -= 4u;", f"  store32(esp, 0x{self._pc(fallthrough):08x}u);", f"  d2_next_pc = 0x{self._pc(target):08x}u;", "  return D2_ACTION_CONTINUE;"]
+            lines += ["  esp -= 4u;", f"  store32(esp, 0x{self._pc(fallthrough):08x}u);", f"  d2_next_pc = 0x{self._pc(target):08x}u;", "  D2_CHAIN();"]
         elif block.terminator == "jump":
-            lines += [f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;", "  return D2_ACTION_CONTINUE;"]
+            lines += [f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;", "  D2_CHAIN();"]
         elif block.terminator == "fallthrough" and block.successors:
-            lines += [f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;", "  return D2_ACTION_CONTINUE;"]
+            lines += [f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;", "  D2_CHAIN();"]
         elif block.terminator == "jump_table":
             instruction = block.instructions[-1]
             address = self._address(instruction, instruction.operands[0])
             if address is None:
                 lines += ["  d2_status = D2_STATUS_UNSUPPORTED;", "  return D2_ACTION_RETURN;"]
             else:
-                lines += [f"  d2_next_pc = {self._dynamic_pc(f'load32({address})')};", "  return D2_ACTION_CONTINUE;"]
+                lines += [f"  d2_next_pc = {self._dynamic_pc(f'load32({address})')};", "  D2_CHAIN();"]
         elif block.terminator == "conditional":
             condition = self._condition(block.instructions[-1])
             if condition is None:
                 lines += ["  d2_status = D2_STATUS_UNSUPPORTED;", "  return D2_ACTION_RETURN;"]
             else:
                 target, fallthrough = block.successors
-                lines += [f"  d2_next_pc = ({condition}) ? 0x{self._pc(target):08x}u : 0x{self._pc(fallthrough):08x}u;", "  return D2_ACTION_CONTINUE;"]
+                lines += [f"  d2_next_pc = ({condition}) ? 0x{self._pc(target):08x}u : 0x{self._pc(fallthrough):08x}u;", "  D2_CHAIN();"]
         elif block.terminator == "import_call":
             assert block.imported_call is not None
             key = block.imported_call.display_name
@@ -788,17 +788,17 @@ class CGenerator:
                     "  store32(esp + 8u, (uint32_t)(uintptr_t)d2_dsound_description);",
                     "  store32(esp + 12u, (uint32_t)(uintptr_t)d2_dsound_module);",
                     "  d2_next_pc = a;",
-                    "  return D2_ACTION_CONTINUE;",
+                    "  D2_CHAIN();",
                 ]
             elif intrinsic is not None:
                 lines.extend(f"  {line}" for line in intrinsic)
-                lines += [f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;", "  return D2_ACTION_CONTINUE;"]
+                lines += [f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;", "  D2_CHAIN();"]
             elif internal_target is not None:
                 lines += [
                     "  esp -= 4u;",
                     f"  store32(esp, 0x{self._pc(block.successors[0]):08x}u);",
                     f"  d2_next_pc = 0x{internal_target:08x}u;",
-                    "  return D2_ACTION_CONTINUE;",
+                    "  D2_CHAIN();",
                 ]
             elif spec is None:
                 instruction = block.instructions[-1]
@@ -813,7 +813,7 @@ class CGenerator:
                 if spec.no_return:
                     lines += ["  d2_status = D2_STATUS_OK;", "  return D2_ACTION_RETURN;"]
                 else:
-                    lines += [f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;", "  return D2_ACTION_CONTINUE;"]
+                    lines += [f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;", "  D2_CHAIN();"]
         elif block.terminator == "import_jump":
             assert block.imported_call is not None
             key = block.imported_call.display_name
@@ -829,7 +829,7 @@ class CGenerator:
                     "  store32(esp + 4u, (uint32_t)(uintptr_t)d2_dsound_module);",
                     "  esp -= 8u;",
                     "  d2_next_pc = a;",
-                    "  return D2_ACTION_CONTINUE;",
+                    "  D2_CHAIN();",
                 ]
             elif intrinsic is not None:
                 lines.extend(f"  {line}" for line in intrinsic)
@@ -837,12 +837,12 @@ class CGenerator:
                     "  d2_next_pc = load32(esp);",
                     "  esp += 4u;",
                     "  if (d2_next_pc == D2_RETURN_SENTINEL) { d2_status = D2_STATUS_OK; return D2_ACTION_RETURN; }",
-                    "  return D2_ACTION_CONTINUE;",
+                    "  D2_CHAIN();",
                 ]
             elif internal_target is not None:
                 lines += [
                     f"  d2_next_pc = 0x{internal_target:08x}u;",
-                    "  return D2_ACTION_CONTINUE;",
+                    "  D2_CHAIN();",
                 ]
             elif spec is None:
                 instruction = block.instructions[-1]
@@ -857,7 +857,7 @@ class CGenerator:
                     "  d2_next_pc = load32(esp);",
                     f"  esp += {4 + cleanup}u;",
                     "  if (d2_next_pc == D2_RETURN_SENTINEL) { d2_status = D2_STATUS_OK; return D2_ACTION_RETURN; }",
-                    "  return D2_ACTION_CONTINUE;",
+                    "  D2_CHAIN();",
                 ]
         elif block.terminator in ("indirect_call", "indirect_jump"):
             instruction = block.instructions[-1]
@@ -869,7 +869,7 @@ class CGenerator:
                 lines.append(f"  a = {target[0]};")
                 if block.terminator == "indirect_call":
                     lines += ["  esp -= 4u;", f"  store32(esp, 0x{self._pc(block.successors[0]):08x}u);"]
-                lines += [f"  d2_next_pc = {self._dynamic_pc('a')};", "  return D2_ACTION_CONTINUE;"]
+                lines += [f"  d2_next_pc = {self._dynamic_pc('a')};", "  D2_CHAIN();"]
         else:
             reason = block.unsupported_reason or f"unexpected terminator {block.terminator}"
             if block.instructions:
@@ -908,18 +908,27 @@ def _render_c(pages: dict[int, list[str]], used_apis: dict[str, ApiSpec]) -> str
     for page, cases in sorted(pages.items()):
         case_text = "\n".join("    " + line for line in cases)
         shards.append(
+            "#define D2_CHAIN() do { "
+            f"if (d2_yield_requested || !*block_fuel || (d2_next_pc >> 12) != 0x{page:05x}u) "
+            "return D2_ACTION_CONTINUE; "
+            "pc = d2_next_pc; goto d2_page_dispatch; } while (0)\n"
             "__attribute__((noinline))\n"
-            f"static uint32_t d2_page_{page:05x}(uint32_t pc) {{\n"
+            f"static uint32_t d2_page_{page:05x}(uint32_t pc, uint32_t *block_fuel) {{\n"
             "  uint32_t a = 0, b = 0, result = 0, old_cf = 0;\n"
             "  int64_t wide_result = 0, signed_divisor = 0, signed_quotient = 0, signed_remainder = 0;\n"
             "  uint64_t wide_unsigned = 0;\n"
+            "d2_page_dispatch:\n"
+            "  D2_BEGIN_BLOCK(pc, block_fuel);\n"
             "  switch (pc) {\n"
             f"{case_text}\n"
             "    default: d2_status = D2_STATUS_MISSING_BLOCK; return D2_ACTION_RETURN;\n"
             "  }\n"
             "}\n"
+            "#undef D2_CHAIN\n"
         )
-        page_dispatch.append(f"    case 0x{page:05x}u: return d2_page_{page:05x}(pc);")
+        page_dispatch.append(
+            f"    case 0x{page:05x}u: return d2_page_{page:05x}(pc, block_fuel);"
+        )
     imports = []
     host_thunk_dispatch = []
     thunk_keys: dict[int, str] = {}
@@ -958,6 +967,7 @@ def _render_c(pages: dict[int, list[str]], used_apis: dict[str, ApiSpec]) -> str
         host_thunk_dispatch.extend(lines)
     return (
         C_TEMPLATE.replace("@IMPORTS@", "\n".join(imports))
+        .replace("@HOST_THUNK_BASE@", f"{HOST_THUNK_BASE:08x}")
         .replace("@HOST_THUNK_DISPATCH@", "\n".join(host_thunk_dispatch))
         .replace("@SHARDS@", "\n".join(shards))
         .replace("@PAGE_DISPATCH@", "\n".join(page_dispatch))
@@ -1189,11 +1199,44 @@ static inline uint32_t rotate_value(uint32_t value, uint32_t count, uint32_t bit
   return result;
 }
 
+#define D2_BEGIN_BLOCK(pc_value, fuel_pointer) do { \
+  if (!*(fuel_pointer)) return D2_ACTION_CONTINUE; \
+  (*(fuel_pointer))--; \
+  uint32_t d2_current_pc = (pc_value); \
+  d2_previous_pc = d2_last_pc; \
+  d2_last_pc = d2_current_pc; \
+  if (__builtin_expect(d2_diagnostics_enabled, 0)) { \
+    d2_trace_pc[d2_trace_index & D2_TRACE_MASK] = d2_current_pc; \
+    d2_trace_esp[d2_trace_index & D2_TRACE_MASK] = esp; \
+    d2_trace_index++; \
+    if (d2_current_pc == d2_count_pc) d2_count_hits++; \
+    if (!d2_watch_hit && d2_current_pc == d2_watch_pc) { \
+      if (d2_watch_skip) { d2_watch_skip--; } \
+      else { \
+        d2_watch_hit = 1; \
+        d2_watch_registers[0] = eax; d2_watch_registers[1] = ebx; \
+        d2_watch_registers[2] = ecx; d2_watch_registers[3] = edx; \
+        d2_watch_registers[4] = esi; d2_watch_registers[5] = edi; \
+        d2_watch_registers[6] = ebp; d2_watch_registers[7] = esp; \
+        if (d2_stop_on_watch) { \
+          d2_status = D2_STATUS_YIELDED; \
+          return D2_ACTION_RETURN; \
+        } \
+      } \
+    } \
+  } \
+} while (0)
+
 @SHARDS@
 
 __attribute__((noinline))
-static uint32_t d2_dispatch_block(uint32_t pc) {
+static uint32_t d2_dispatch_block(uint32_t pc, uint32_t *block_fuel) {
+  if (pc >= 0x@HOST_THUNK_BASE@u) {
+    D2_BEGIN_BLOCK(pc, block_fuel);
 @HOST_THUNK_DISPATCH@
+    d2_status = D2_STATUS_MISSING_BLOCK;
+    return D2_ACTION_RETURN;
+  }
   switch (pc >> 12) {
 @PAGE_DISPATCH@
     default: d2_status = D2_STATUS_MISSING_BLOCK; return D2_ACTION_RETURN;
@@ -1216,27 +1259,8 @@ static void d2_initialize_cpu(uint32_t entry_rva, uint32_t initial_esp) {
 
 __attribute__((noinline))
 static uint32_t d2_execute(uint32_t block_fuel) {
-  while (block_fuel--) {
-    d2_previous_pc = d2_last_pc;
-    d2_last_pc = d2_next_pc;
-    if (__builtin_expect(d2_diagnostics_enabled, 0)) {
-      d2_trace_pc[d2_trace_index & D2_TRACE_MASK] = d2_next_pc;
-      d2_trace_esp[d2_trace_index & D2_TRACE_MASK] = esp;
-      d2_trace_index++;
-      if (d2_next_pc == d2_count_pc) d2_count_hits++;
-      if (!d2_watch_hit && d2_next_pc == d2_watch_pc) {
-        if (d2_watch_skip) { d2_watch_skip--; }
-        else {
-        d2_watch_hit = 1;
-        d2_watch_registers[0] = eax; d2_watch_registers[1] = ebx;
-        d2_watch_registers[2] = ecx; d2_watch_registers[3] = edx;
-        d2_watch_registers[4] = esi; d2_watch_registers[5] = edi;
-        d2_watch_registers[6] = ebp; d2_watch_registers[7] = esp;
-        if (d2_stop_on_watch) { d2_status = D2_STATUS_YIELDED; return eax; }
-        }
-      }
-    }
-    if (d2_dispatch_block(d2_next_pc) == D2_ACTION_RETURN) return eax;
+  while (block_fuel) {
+    if (d2_dispatch_block(d2_next_pc, &block_fuel) == D2_ACTION_RETURN) return eax;
     if (d2_yield_requested) {
       d2_status = D2_STATUS_YIELDED;
       return eax;

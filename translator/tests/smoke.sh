@@ -19,6 +19,13 @@ const fs = require("node:fs");
 const path = process.argv[2];
 (async () => {
   const { instance } = await WebAssembly.instantiate(fs.readFileSync(path), {});
+  instance.exports.d2_set_count_pc(0x1000);
+  instance.exports.d2_run(0x1000, 0x100000, 1);
+  const partialStatus = instance.exports.d2_last_status();
+  const countedBlocks = instance.exports.d2_count_hits();
+  if (partialStatus !== 1 || countedBlocks !== 1) {
+    throw new Error(`one-block run returned status ${partialStatus}, count ${countedBlocks}`);
+  }
   const result = instance.exports.d2_run(0x1000, 0x100000, 100);
   const status = instance.exports.d2_last_status();
   if (result !== 42 || status !== 0) {
