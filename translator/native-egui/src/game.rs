@@ -9,13 +9,16 @@ use anyhow::{Context, Result, bail};
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::ErrorKind,
+    os::unix::fs::symlink,
     path::PathBuf,
+    process,
     sync::mpsc::{Receiver, SyncSender},
     time::{Duration, Instant},
 };
 use wasmtime::{
-    Caller, Engine, Error as WasmtimeError, Extern, ExternType, Instance, Linker, Memory, Module,
-    Store, Val,
+    Caller, Config, Engine, Error as WasmtimeError, Extern, ExternType, Instance, Linker, Memory,
+    Module, ProfilingStrategy, Store, Val,
 };
 
 const STACK_TOP: u32 = 0x1000_0000;
@@ -88,7 +91,25 @@ pub fn run(
         &options.host_root,
     )?;
     send(&event_tx, HostEvent::Log(gameplay.description().to_owned()));
-    let engine = Engine::default();
+    let engine = if environment_u32("D2_JIT_PERFMAP")?.unwrap_or(0) != 0 {
+        if let Some(directory) = std::env::var_os("D2_JIT_PERFMAP_DIR") {
+            let file_name = format!("perf-{}.map", process::id());
+            let default_path = PathBuf::from("/tmp").join(&file_name);
+            let redirected_path = PathBuf::from(directory).join(file_name);
+            fs::create_dir_all(redirected_path.parent().unwrap())?;
+            match fs::remove_file(&default_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            symlink(&redirected_path, &default_path)?;
+        }
+        let mut config = Config::new();
+        config.profiler(ProfilingStrategy::PerfMap);
+        wt(Engine::new(&config))?
+    } else {
+        Engine::default()
+    };
     let module = load_module(&engine, &options.wasm, &event_tx)?;
     let heap_base = manifest
         .summary
