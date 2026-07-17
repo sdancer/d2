@@ -713,6 +713,11 @@ fn load_module(
 }
 
 fn register_imports(module: &Module, linker: &mut Linker<HostState>) -> Result<()> {
+    enum HostSignature {
+        StackPointer,
+        DirectSoundDispatch,
+    }
+
     let imports = module
         .imports()
         .map(|import| {
@@ -723,91 +728,125 @@ fn register_imports(module: &Module, linker: &mut Linker<HostState>) -> Result<(
                     import.name()
                 );
             };
-            if function_type.params().len() != 1
-                || !function_type
-                    .params()
-                    .next()
-                    .is_some_and(|parameter| parameter.is_i32())
-                || function_type.results().len() != 1
-                || !function_type
-                    .results()
-                    .next()
-                    .is_some_and(|result| result.is_i32())
+            let parameters = function_type.params().collect::<Vec<_>>();
+            let results = function_type.results().collect::<Vec<_>>();
+            let signature = if parameters.len() == 1
+                && parameters[0].is_i32()
+                && results.len() == 1
+                && results[0].is_i32()
             {
+                HostSignature::StackPointer
+            } else if import.module() == "win32.dsound.dll"
+                && import.name() == "__dispatch"
+                && parameters.len() == 2
+                && parameters.iter().all(|parameter| parameter.is_i32())
+                && results.len() == 1
+                && results[0].is_i32()
+            {
+                HostSignature::DirectSoundDispatch
+            } else {
                 bail!(
-                    "unexpected host signature for {}!{}",
+                    "unexpected host signature for {}!{}: params={parameters:?}, results={results:?}",
                     import.module(),
                     import.name()
                 );
-            }
-            Ok((import.module().to_owned(), import.name().to_owned()))
+            };
+            Ok((
+                import.module().to_owned(),
+                import.name().to_owned(),
+                signature,
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    for (library, name) in imports {
+    for (library, name, signature) in imports {
         let callback_library = library.clone();
         let callback_name = name.clone();
-        wt(linker.func_wrap(
-            &library,
-            &name,
-            move |mut caller: Caller<'_, HostState>, sp: i32| {
-                let memory = exported_memory(&mut caller)?;
-                let outcome = {
-                    let (bytes, state) = memory.data_and_store_mut(&mut caller);
-                    state
-                        .runtime
-                        .dispatch(&callback_library, &callback_name, sp as u32, bytes)
-                        .map_err(|error| WasmtimeError::msg(format!("{error:#}")))?
-                };
-                if callback_library == "win32.user32.dll"
-                    && callback_name == "MessageBoxA"
-                    && caller.data_mut().runtime.take_message_box_trace_request()
-                {
-                    let trace = capture_assertion_trace(&mut caller)?;
-                    eprintln!("MessageBoxA translated trace:\n{trace}");
-                    caller
-                        .data()
-                        .runtime
-                        .log(format!("MessageBoxA translated trace:\n{trace}"));
-                }
-                let value = match outcome {
-                    DispatchResult::Value(value) => value,
-                    DispatchResult::Invoke(request) => {
-                        let (address, arguments, count) = {
-                            let (bytes, state) = memory.data_and_store_mut(&mut caller);
-                            state
-                                .runtime
-                                .prepare_invoke(bytes, request)
-                                .map_err(|error| WasmtimeError::msg(format!("{error:#}")))?
-                        };
-                        let function = caller
-                            .get_export("d2_invoke_current")
-                            .and_then(Extern::into_func)
-                            .ok_or_else(|| {
-                                WasmtimeError::msg("d2_invoke_current export is unavailable")
-                            })?;
-                        let mut callback_result = [Val::I32(0)];
-                        function.call(
-                            &mut caller,
-                            &[
-                                Val::I32(address as i32),
-                                Val::I32(arguments as i32),
-                                Val::I32(count as i32),
-                                Val::I32(FUEL_PER_ROUND as i32),
-                            ],
-                            &mut callback_result,
-                        )?;
-                        callback_result[0].unwrap_i32() as u32
-                    }
-                    DispatchResult::Wait(request) => run_wait(&mut caller, request)?,
-                    DispatchResult::Yield => run_yield(&mut caller)?,
-                    DispatchResult::Sleep(milliseconds) => run_sleep(&mut caller, milliseconds)?,
-                };
-                Ok(value as i32)
-            },
-        ))?;
+        match signature {
+            HostSignature::StackPointer => wt(linker.func_wrap(
+                &library,
+                &name,
+                move |caller: Caller<'_, HostState>, sp: i32| {
+                    dispatch_host_import(caller, &callback_library, &callback_name, sp as u32, None)
+                },
+            ))?,
+            HostSignature::DirectSoundDispatch => wt(linker.func_wrap(
+                &library,
+                &name,
+                move |caller: Caller<'_, HostState>, method: i32, sp: i32| {
+                    dispatch_host_import(
+                        caller,
+                        &callback_library,
+                        &callback_name,
+                        sp as u32,
+                        Some(method as u32),
+                    )
+                },
+            ))?,
+        };
     }
     Ok(())
+}
+
+fn dispatch_host_import(
+    mut caller: Caller<'_, HostState>,
+    library: &str,
+    name: &str,
+    sp: u32,
+    direct_sound_method: Option<u32>,
+) -> Result<i32, WasmtimeError> {
+    let memory = exported_memory(&mut caller)?;
+    let outcome = {
+        let (bytes, state) = memory.data_and_store_mut(&mut caller);
+        match direct_sound_method {
+            Some(method) => state.runtime.dispatch_direct_sound(method, sp, bytes),
+            None => state.runtime.dispatch(library, name, sp, bytes),
+        }
+        .map_err(|error| WasmtimeError::msg(format!("{error:#}")))?
+    };
+    if library == "win32.user32.dll"
+        && name == "MessageBoxA"
+        && caller.data_mut().runtime.take_message_box_trace_request()
+    {
+        let trace = capture_assertion_trace(&mut caller)?;
+        eprintln!("MessageBoxA translated trace:\n{trace}");
+        caller
+            .data()
+            .runtime
+            .log(format!("MessageBoxA translated trace:\n{trace}"));
+    }
+    let value = match outcome {
+        DispatchResult::Value(value) => value,
+        DispatchResult::Invoke(request) => {
+            let (address, arguments, count) = {
+                let (bytes, state) = memory.data_and_store_mut(&mut caller);
+                state
+                    .runtime
+                    .prepare_invoke(bytes, request)
+                    .map_err(|error| WasmtimeError::msg(format!("{error:#}")))?
+            };
+            let function = caller
+                .get_export("d2_invoke_current")
+                .and_then(Extern::into_func)
+                .ok_or_else(|| WasmtimeError::msg("d2_invoke_current export is unavailable"))?;
+            let mut callback_result = [Val::I32(0)];
+            function.call(
+                &mut caller,
+                &[
+                    Val::I32(address as i32),
+                    Val::I32(arguments as i32),
+                    Val::I32(count as i32),
+                    Val::I32(FUEL_PER_ROUND as i32),
+                ],
+                &mut callback_result,
+            )?;
+            callback_result[0].unwrap_i32() as u32
+        }
+        DispatchResult::Wait(request) => run_wait(&mut caller, request)?,
+        DispatchResult::Yield => run_yield(&mut caller)?,
+        DispatchResult::Sleep(milliseconds) => run_sleep(&mut caller, milliseconds)?,
+    };
+    Ok(value as i32)
 }
 
 fn capture_assertion_trace(caller: &mut Caller<'_, HostState>) -> Result<String, WasmtimeError> {

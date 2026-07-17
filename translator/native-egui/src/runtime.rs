@@ -481,6 +481,19 @@ impl Runtime {
         Ok(DispatchResult::Value(value))
     }
 
+    pub fn dispatch_direct_sound(
+        &mut self,
+        method: u32,
+        _sp: u32,
+        _memory: &mut [u8],
+    ) -> Result<DispatchResult> {
+        Ok(DispatchResult::Value(self.unknown(
+            "win32.dsound.dll",
+            &format!("__dispatch[{method}]"),
+            0x8878_0078,
+        )))
+    }
+
     fn unknown(&mut self, library: &str, name: &str, fallback: u32) -> u32 {
         let key = format!("{library}!{name}");
         if self.unknown_apis.insert(key.clone()) {
