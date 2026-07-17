@@ -108,6 +108,7 @@ struct FileHandle {
 #[derive(Debug)]
 struct ThreadState {
     start: u32,
+    stack_base: u32,
     stack_top: u32,
     context: u32,
     exit_code: u32,
@@ -115,6 +116,116 @@ struct ThreadState {
     finished: bool,
     wait: Option<ThreadWait>,
     resume_result: Option<u32>,
+}
+
+#[derive(Debug)]
+struct GuestAllocator {
+    heap_cursor: u32,
+    allocations: HashMap<u32, u32>,
+    free_ranges: Vec<(u32, u32)>,
+    reserved_ranges: Vec<(u32, u32)>,
+}
+
+impl GuestAllocator {
+    fn new(heap_base: u32) -> Self {
+        Self {
+            heap_cursor: heap_base,
+            allocations: HashMap::new(),
+            free_ranges: Vec::new(),
+            reserved_ranges: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self, memory: &mut [u8], size: u32, alignment: u32) -> Result<u32> {
+        let size = size.max(1);
+        let alignment = alignment.max(1);
+        if !alignment.is_power_of_two() {
+            bail!("host allocation alignment is not a power of two: {alignment}");
+        }
+
+        for index in 0..self.free_ranges.len() {
+            let (range_start, range_end) = self.free_ranges[index];
+            let start = align_up(range_start, alignment)?;
+            let end = start
+                .checked_add(size)
+                .context("host allocation overflow")?;
+            if end > range_end {
+                continue;
+            }
+
+            self.free_ranges.remove(index);
+            let mut insert_at = index;
+            if range_start < start {
+                self.free_ranges.insert(insert_at, (range_start, start));
+                insert_at += 1;
+            }
+            if end < range_end {
+                self.free_ranges.insert(insert_at, (end, range_end));
+            }
+            memory[start as usize..end as usize].fill(0);
+            self.allocations.insert(start, size);
+            return Ok(start);
+        }
+
+        let mut start = align_up(self.heap_cursor, alignment)?;
+        for &(reserved_start, reserved_end) in &self.reserved_ranges {
+            let end = start
+                .checked_add(size)
+                .context("host allocation overflow")?;
+            if start < reserved_end && end > reserved_start {
+                start = align_up(reserved_end, alignment)?;
+            }
+        }
+        let end = start
+            .checked_add(size)
+            .context("host allocation overflow")?;
+        if end as usize > memory.len() {
+            bail!("host allocation exceeds pre-grown Wasm memory: {end:#x}");
+        }
+        memory[start as usize..end as usize].fill(0);
+        self.heap_cursor = end;
+        self.allocations.insert(start, size);
+        Ok(start)
+    }
+
+    fn free(&mut self, pointer: u32) -> bool {
+        let Some(size) = self.allocations.remove(&pointer) else {
+            return false;
+        };
+        let mut start = pointer;
+        let mut end = pointer + size;
+        let mut index = 0;
+        while index < self.free_ranges.len() && self.free_ranges[index].1 < start {
+            index += 1;
+        }
+        while index < self.free_ranges.len() && self.free_ranges[index].0 <= end {
+            let range = self.free_ranges.remove(index);
+            start = start.min(range.0);
+            end = end.max(range.1);
+        }
+        self.free_ranges.insert(index, (start, end));
+        true
+    }
+
+    fn allocation_size(&self, pointer: u32) -> Option<u32> {
+        self.allocations.get(&pointer).copied()
+    }
+
+    fn reserve(&mut self, start: u32, end: u32) -> Result<()> {
+        if end <= start {
+            bail!("reserved memory range must be non-empty");
+        }
+        self.reserved_ranges.push((start, end));
+        self.reserved_ranges.sort_by_key(|range| range.0);
+        Ok(())
+    }
+}
+
+fn align_up(value: u32, alignment: u32) -> Result<u32> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+        .context("host allocation overflow")
 }
 
 #[derive(Clone, Debug)]
@@ -219,7 +330,7 @@ struct FindState {
 
 pub struct Runtime {
     pub last_error: u32,
-    heap_cursor: u32,
+    allocator: GuestAllocator,
     next_handle: u32,
     next_tls: u32,
     tls: HashMap<u32, u32>,
@@ -229,8 +340,6 @@ pub struct Runtime {
     critical_sections: HashMap<u32, CriticalSectionState>,
     message_box_counts: HashMap<(String, String), u64>,
     message_box_trace_pending: bool,
-    allocations: HashMap<u32, u32>,
-    reserved_ranges: Vec<(u32, u32)>,
     module_handles: HashMap<String, u32>,
     module_exports: HashMap<(u32, String), u32>,
     current_directory: String,
@@ -238,6 +347,8 @@ pub struct Runtime {
     gameplay: GameplaySession,
     command_line: String,
     command_line_pointer: u32,
+    locale_pointer: u32,
+    inet_ntoa_pointer: u32,
     registry_values: HashMap<String, String>,
     clipboard: HashMap<u32, u32>,
     screen_bitmap_handle: u32,
@@ -300,7 +411,7 @@ impl Runtime {
             .collect();
         Self {
             last_error: 0,
-            heap_cursor: heap_base,
+            allocator: GuestAllocator::new(heap_base),
             next_handle: 0x100,
             next_tls: 0,
             tls: HashMap::new(),
@@ -315,8 +426,6 @@ impl Runtime {
             critical_sections: HashMap::new(),
             message_box_counts: HashMap::new(),
             message_box_trace_pending: false,
-            allocations: HashMap::new(),
-            reserved_ranges: Vec::new(),
             module_handles: HashMap::from([(String::from("<main>"), 0x0040_0000)]),
             module_exports: HashMap::new(),
             current_directory: String::from("C:\\Diablo II"),
@@ -324,6 +433,8 @@ impl Runtime {
             gameplay,
             command_line: String::from("\"C:\\Diablo II\\Diablo II.exe\" -w"),
             command_line_pointer: 0,
+            locale_pointer: 0,
+            inet_ntoa_pointer: 0,
             registry_values: HashMap::from([
                 (String::from("installpath"), String::from("C:\\Diablo II")),
                 (String::from("install path"), String::from("C:\\Diablo II")),
@@ -390,43 +501,19 @@ impl Runtime {
     }
 
     pub fn alloc(&mut self, memory: &mut [u8], size: u32, alignment: u32) -> Result<u32> {
-        let size = size.max(1);
-        let alignment = alignment.max(1);
-        let mut start = self
-            .heap_cursor
-            .checked_add(alignment - 1)
-            .map(|value| value & !(alignment - 1))
-            .context("host allocation overflow")?;
-        for &(reserved_start, reserved_end) in &self.reserved_ranges {
-            let end = start
-                .checked_add(size)
-                .context("host allocation overflow")?;
-            if start < reserved_end && end > reserved_start {
-                start = reserved_end
-                    .checked_add(alignment - 1)
-                    .map(|value| value & !(alignment - 1))
-                    .context("host allocation overflow")?;
-            }
-        }
-        let end = start
-            .checked_add(size)
-            .context("host allocation overflow")?;
-        if end as usize > memory.len() {
-            bail!("host allocation exceeds pre-grown Wasm memory: {end:#x}");
-        }
-        memory[start as usize..end as usize].fill(0);
-        self.heap_cursor = end;
-        self.allocations.insert(start, size);
-        Ok(start)
+        self.allocator.alloc(memory, size, alignment)
+    }
+
+    fn free(&mut self, pointer: u32) -> bool {
+        self.allocator.free(pointer)
+    }
+
+    fn allocation_size(&self, pointer: u32) -> Option<u32> {
+        self.allocator.allocation_size(pointer)
     }
 
     pub fn reserve(&mut self, start: u32, end: u32) -> Result<()> {
-        if end <= start {
-            bail!("reserved memory range must be non-empty");
-        }
-        self.reserved_ranges.push((start, end));
-        self.reserved_ranges.sort_by_key(|range| range.0);
-        Ok(())
+        self.allocator.reserve(start, end)
     }
 
     pub fn dispatch(
@@ -1036,6 +1123,46 @@ impl Runtime {
         handle
     }
 
+    fn release_handle(&mut self, handle: u32) -> bool {
+        let Some(value) = self.handles.remove(&handle) else {
+            return false;
+        };
+        match value {
+            Handle::Bitmap(bitmap) => {
+                self.free(bitmap.bits);
+                if self.screen_bitmap_handle == handle {
+                    self.screen_bitmap_handle = 0;
+                }
+            }
+            Handle::Thread(thread) => {
+                self.free(thread.stack_base);
+                self.free(thread.context);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn empty_clipboard(&mut self) {
+        let pointers = self
+            .clipboard
+            .drain()
+            .map(|(_, pointer)| pointer)
+            .collect::<HashSet<_>>();
+        for pointer in pointers {
+            self.free(pointer);
+        }
+    }
+
+    fn replace_clipboard_data(&mut self, format: u32, pointer: u32) {
+        if let Some(previous) = self.clipboard.insert(format, pointer)
+            && previous != pointer
+            && !self.clipboard.values().any(|value| *value == previous)
+        {
+            self.free(previous);
+        }
+    }
+
     fn selected_bitmap(&self, dc: u32) -> Option<(u32, Bitmap)> {
         let selected = match self.handles.get(&dc) {
             Some(Handle::Dc { selected, .. }) => *selected,
@@ -1173,6 +1300,76 @@ mod critical_section_tests {
             timeout: u32::MAX,
         };
         assert_eq!(infinite_wait.timeout_result(u32::MAX), None);
+    }
+}
+
+#[cfg(test)]
+mod allocator_tests {
+    use super::*;
+
+    #[test]
+    fn freed_ranges_are_reused_and_zeroed() -> Result<()> {
+        let mut memory = vec![0; 0x10_000];
+        let mut allocator = GuestAllocator::new(0x1_000);
+        let first = allocator.alloc(&mut memory, 0x100, 8)?;
+        let second = allocator.alloc(&mut memory, 0x80, 8)?;
+        memory[first as usize..first as usize + 0x100].fill(0xa5);
+
+        assert!(allocator.free(first));
+        let reused = allocator.alloc(&mut memory, 0x100, 16)?;
+        assert_eq!(reused, first);
+        assert!(
+            memory[reused as usize..reused as usize + 0x100]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(allocator.allocation_size(second), Some(0x80));
+        Ok(())
+    }
+
+    #[test]
+    fn adjacent_frees_coalesce() -> Result<()> {
+        let mut memory = vec![0; 0x10_000];
+        let mut allocator = GuestAllocator::new(0x1_000);
+        let first = allocator.alloc(&mut memory, 0x80, 8)?;
+        let second = allocator.alloc(&mut memory, 0x80, 8)?;
+        let third = allocator.alloc(&mut memory, 0x80, 8)?;
+
+        assert!(allocator.free(second));
+        assert!(allocator.free(first));
+        assert_eq!(allocator.free_ranges, vec![(first, third)]);
+        assert_eq!(allocator.alloc(&mut memory, 0x100, 8)?, first);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_arena_release_does_not_advance_high_water_mark() -> Result<()> {
+        let mut memory = vec![0; 0x40_000];
+        let mut allocator = GuestAllocator::new(0x1_000);
+        let expected = allocator.alloc(&mut memory, 0x10_000, 0x10_000)?;
+        assert!(allocator.free(expected));
+        let high_water = allocator.heap_cursor;
+
+        for _ in 0..1_000 {
+            let pointer = allocator.alloc(&mut memory, 0x10_000, 0x10_000)?;
+            assert_eq!(pointer, expected);
+            assert!(allocator.free(pointer));
+        }
+        assert_eq!(allocator.heap_cursor, high_water);
+        Ok(())
+    }
+
+    #[test]
+    fn reserved_ranges_are_skipped() -> Result<()> {
+        let mut memory = vec![0; 0x10_000];
+        let mut allocator = GuestAllocator::new(0x1_000);
+        allocator.reserve(0x1_800, 0x2_800)?;
+
+        let first = allocator.alloc(&mut memory, 0x700, 0x100)?;
+        let second = allocator.alloc(&mut memory, 0x200, 0x100)?;
+        assert_eq!(first, 0x1_000);
+        assert_eq!(second, 0x2_800);
+        Ok(())
     }
 }
 

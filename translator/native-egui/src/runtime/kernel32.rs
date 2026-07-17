@@ -161,7 +161,7 @@ impl Runtime {
             }
             "WaitForMultipleObjects" => Ok(0),
             "CloseHandle" | "FindClose" => {
-                self.handles.remove(&arg(memory, sp, 0));
+                self.release_handle(arg(memory, sp, 0));
                 Ok(1)
             }
             "OpenEventA" => Ok(0),
@@ -244,9 +244,16 @@ impl Runtime {
                 let stack_base = self.alloc(memory, stack_size, 16)?;
                 let stack_top = stack_base.wrapping_add(stack_size).wrapping_sub(0x100) & !15;
                 write_u32(memory, stack_top, arg(memory, sp, 3))?;
-                let context = self.alloc(memory, 256, 8)?;
+                let context = match self.alloc(memory, 256, 8) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        self.free(stack_base);
+                        return Err(error);
+                    }
+                };
                 let handle = self.new_handle(Handle::Thread(ThreadState {
                     start: arg(memory, sp, 2),
+                    stack_base,
                     stack_top,
                     context,
                     exit_code: 259,
@@ -310,22 +317,21 @@ impl Runtime {
                 write_u32(memory, pointer, 0)?;
                 Ok(pointer)
             }
-            "FreeEnvironmentStringsA" | "FreeEnvironmentStringsW" => Ok(1),
+            "FreeEnvironmentStringsA" | "FreeEnvironmentStringsW" => {
+                self.free(arg(memory, sp, 0));
+                Ok(1)
+            }
             "HeapCreate" | "HeapDestroy" => Ok(1),
-            "HeapSize" => Ok(self
-                .allocations
-                .get(&arg(memory, sp, 2))
-                .copied()
-                .unwrap_or(u32::MAX)),
+            "HeapSize" => Ok(self.allocation_size(arg(memory, sp, 2)).unwrap_or(u32::MAX)),
             "HeapAlloc" => self.alloc(memory, arg(memory, sp, 2), 8),
             "HeapFree" => {
-                self.allocations.remove(&arg(memory, sp, 2));
+                self.free(arg(memory, sp, 2));
                 Ok(1)
             }
             "HeapReAlloc" => self.heap_realloc(sp, memory),
             "LocalAlloc" | "GlobalAlloc" => self.alloc(memory, arg(memory, sp, 1), 8),
             "LocalFree" | "GlobalFree" => {
-                self.allocations.remove(&arg(memory, sp, 0));
+                self.free(arg(memory, sp, 0));
                 Ok(0)
             }
             "GlobalLock" => Ok(arg(memory, sp, 0)),
@@ -338,7 +344,15 @@ impl Runtime {
                     Ok(requested)
                 }
             }
-            "VirtualFree" | "VirtualUnlock" => Ok(1),
+            "VirtualFree" => {
+                let free_type = arg(memory, sp, 2);
+                if free_type & 0x8000 != 0 {
+                    Ok(u32::from(self.free(arg(memory, sp, 0))))
+                } else {
+                    Ok(1)
+                }
+            }
+            "VirtualUnlock" => Ok(1),
             "VirtualQuery" | "VirtualQueryEx" => self.virtual_query(name, sp, memory),
             "CreateDirectoryA" => {
                 let path = self.host_path(&self.read_c_string(memory, arg(memory, sp, 0)));
@@ -536,13 +550,13 @@ impl Runtime {
     fn heap_realloc(&mut self, sp: u32, memory: &mut [u8]) -> Result<u32> {
         let old = arg(memory, sp, 2);
         let size = arg(memory, sp, 3);
-        let old_size = self.allocations.get(&old).copied().unwrap_or(0);
+        let old_size = self.allocation_size(old).unwrap_or(0);
         let pointer = self.alloc(memory, size, 8)?;
         if old != 0 && old_size != 0 {
             let count = old_size.min(size) as usize;
             let bytes = memory[old as usize..old as usize + count].to_vec();
             memory[pointer as usize..pointer as usize + count].copy_from_slice(&bytes);
-            self.allocations.remove(&old);
+            self.free(old);
         }
         Ok(pointer)
     }

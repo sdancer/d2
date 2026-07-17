@@ -5,7 +5,7 @@ impl Runtime {
         match name {
             "GetStockObject" => Ok(0x7000_0000 | arg(memory, sp, 0)),
             "DeleteObject" | "DeleteDC" => {
-                self.handles.remove(&arg(memory, sp, 0));
+                self.release_handle(arg(memory, sp, 0));
                 Ok(1)
             }
             "CreateCompatibleDC" | "CreateDCA" => Ok(self.new_handle(Handle::Dc {

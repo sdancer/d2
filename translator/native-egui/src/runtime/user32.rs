@@ -37,7 +37,7 @@ impl Runtime {
                 })
             }
             "ReleaseDC" => {
-                self.handles.remove(&arg(memory, sp, 1));
+                self.release_handle(arg(memory, sp, 1));
                 1
             }
             "DrawTextA" => 16,
@@ -68,7 +68,7 @@ impl Runtime {
                 1
             }
             "DestroyWindow" => {
-                self.handles.remove(&arg(memory, sp, 0));
+                self.release_handle(arg(memory, sp, 0));
                 1
             }
             "SetFocus" => {
@@ -268,13 +268,13 @@ impl Runtime {
             "RegisterWindowMessageA" => 0xc000,
             "PostQuitMessage" => 0,
             "EmptyClipboard" => {
-                self.clipboard.clear();
+                self.empty_clipboard();
                 1
             }
             "SetClipboardData" => {
                 let format = arg(memory, sp, 0);
                 let value = arg(memory, sp, 1);
-                self.clipboard.insert(format, value);
+                self.replace_clipboard_data(format, value);
                 value
             }
             "GetClipboardData" => self

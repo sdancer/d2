@@ -119,7 +119,7 @@ impl Runtime {
                 Ok(0)
             }
             "RegCloseKey" => {
-                self.handles.remove(&arg(memory, sp, 0));
+                self.release_handle(arg(memory, sp, 0));
                 Ok(0)
             }
             "GetUserNameA" => {
@@ -145,7 +145,7 @@ impl Runtime {
                 Ok(0)
             }
             "CloseServiceHandle" => {
-                self.handles.remove(&arg(memory, sp, 0));
+                self.release_handle(arg(memory, sp, 0));
                 Ok(1)
             }
             "SetServiceStatus" => Ok(1),
@@ -238,7 +238,12 @@ impl Runtime {
                 memory[destination..destination + count].copy_from_slice(&bytes);
                 Ok(destination as u32)
             }
-            "setlocale" => self.alloc_c_string(memory, "C"),
+            "setlocale" => {
+                if self.locale_pointer == 0 {
+                    self.locale_pointer = self.alloc_c_string(memory, "C")?;
+                }
+                Ok(self.locale_pointer)
+            }
             "strpbrk" => {
                 let pointer = arg(memory, sp, 0);
                 let text = self.read_c_string(memory, pointer);
@@ -422,7 +427,7 @@ impl Runtime {
                 Ok(u32::MAX)
             }
             "#3" => {
-                self.handles.remove(&arg(memory, sp, 0));
+                self.release_handle(arg(memory, sp, 0));
                 Ok(0)
             }
             "#9" => {
@@ -446,16 +451,18 @@ impl Runtime {
             }
             "#11" => {
                 let value = arg(memory, sp, 0);
-                self.alloc_c_string(
-                    memory,
-                    &format!(
-                        "{}.{}.{}.{}",
-                        value & 0xff,
-                        value >> 8 & 0xff,
-                        value >> 16 & 0xff,
-                        value >> 24 & 0xff
-                    ),
-                )
+                if self.inet_ntoa_pointer == 0 {
+                    self.inet_ntoa_pointer = self.alloc(memory, 16, 1)?;
+                }
+                let text = format!(
+                    "{}.{}.{}.{}",
+                    value & 0xff,
+                    value >> 8 & 0xff,
+                    value >> 16 & 0xff,
+                    value >> 24 & 0xff
+                );
+                self.write_c_string(memory, self.inet_ntoa_pointer, 16, &text)?;
+                Ok(self.inet_ntoa_pointer)
             }
             "#23" => Ok(self.new_handle(Handle::Socket)),
             "#57" => {
