@@ -151,10 +151,7 @@ impl Runtime {
             }
             "TlsGetValue" => Ok(self.tls.get(&arg(memory, sp, 0)).copied().unwrap_or(0)),
             "GetTickCount" => Ok(self.clock_now()),
-            "Sleep" => {
-                self.advance_clock(arg(memory, sp, 0));
-                Ok(0)
-            }
+            "Sleep" => Ok(0),
             "WaitForSingleObject" => {
                 let handle = arg(memory, sp, 0);
                 Ok(match self.handles.get(&handle) {
@@ -185,11 +182,11 @@ impl Runtime {
             "UnhandledExceptionFilter" | "IsBadCodePtr" | "IsBadReadPtr" | "IsBadWritePtr" => Ok(0),
             "GetProcessHeap" => Ok(1),
             "QueryPerformanceFrequency" => {
-                write_u64(memory, arg(memory, sp, 0), 1_000_000)?;
+                write_u64(memory, arg(memory, sp, 0), 1_000_000_000)?;
                 Ok(1)
             }
             "QueryPerformanceCounter" => {
-                let value = u64::from(self.clock_now()) * 1_000;
+                let value = self.performance_counter();
                 write_u64(memory, arg(memory, sp, 0), value)?;
                 Ok(1)
             }
@@ -255,6 +252,8 @@ impl Runtime {
                     exit_code: 259,
                     status: 0,
                     finished: false,
+                    wait: None,
+                    resume_result: None,
                 }));
                 let thread_id = arg(memory, sp, 5);
                 if thread_id != 0 {

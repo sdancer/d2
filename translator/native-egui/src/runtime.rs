@@ -26,6 +26,8 @@ pub enum DispatchResult {
     Value(u32),
     Invoke(InvokeRequest),
     Wait(WaitRequest),
+    Yield,
+    Sleep(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +42,7 @@ pub struct ThreadRun {
     pub context: u32,
     pub start: u32,
     pub stack_top: u32,
+    pub resume_result: Option<u32>,
     previous_thread: Option<u32>,
 }
 
@@ -110,6 +113,61 @@ struct ThreadState {
     exit_code: u32,
     status: u32,
     finished: bool,
+    wait: Option<ThreadWait>,
+    resume_result: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+enum ThreadWait {
+    Handle {
+        handle: u32,
+        started: u32,
+        timeout: u32,
+    },
+    Sleep {
+        started: u32,
+        duration: u32,
+    },
+}
+
+impl ThreadWait {
+    fn timeout_result(&self, now: u32) -> Option<u32> {
+        match *self {
+            Self::Handle {
+                started, timeout, ..
+            } if timeout != u32::MAX && now.wrapping_sub(started) >= timeout => Some(258),
+            Self::Sleep { started, duration } if now.wrapping_sub(started) >= duration => Some(0),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CooperativeScheduler {
+    polls: u32,
+    poll_interval: u32,
+    handoffs: u64,
+    thread_slices: u64,
+}
+
+impl CooperativeScheduler {
+    fn new(poll_interval: u32) -> Self {
+        Self {
+            polls: 0,
+            poll_interval: poll_interval.max(1),
+            handoffs: 0,
+            thread_slices: 0,
+        }
+    }
+
+    fn poll(&mut self) -> bool {
+        self.polls = self.polls.wrapping_add(1);
+        if self.polls % self.poll_interval != 0 {
+            return false;
+        }
+        self.handoffs = self.handoffs.wrapping_add(1);
+        true
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -167,6 +225,7 @@ pub struct Runtime {
     tls: HashMap<u32, u32>,
     handles: HashMap<u32, Handle>,
     current_thread: Option<u32>,
+    scheduler: CooperativeScheduler,
     critical_sections: HashMap<u32, CriticalSectionState>,
     message_box_counts: HashMap<(String, String), u64>,
     message_box_trace_pending: bool,
@@ -194,7 +253,6 @@ pub struct Runtime {
     show_cursor_count: i32,
     virtual_time: u32,
     clock_origin: Instant,
-    clock_offset: u32,
     unknown_apis: HashSet<String>,
     event_tx: SyncSender<HostEvent>,
     input_rx: Receiver<InputEvent>,
@@ -248,6 +306,12 @@ impl Runtime {
             tls: HashMap::new(),
             handles: HashMap::new(),
             current_thread: None,
+            scheduler: CooperativeScheduler::new(
+                std::env::var("D2_COOPERATIVE_POLL_INTERVAL")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(256),
+            ),
             critical_sections: HashMap::new(),
             message_box_counts: HashMap::new(),
             message_box_trace_pending: false,
@@ -294,7 +358,6 @@ impl Runtime {
             show_cursor_count: 0,
             virtual_time: 0,
             clock_origin: Instant::now(),
-            clock_offset: 0,
             unknown_apis: HashSet::new(),
             event_tx,
             input_rx,
@@ -373,6 +436,23 @@ impl Runtime {
         sp: u32,
         memory: &mut [u8],
     ) -> Result<DispatchResult> {
+        if library == "win32.kernel32.dll" && name == "Sleep" {
+            let delay = arg(memory, sp, 0);
+            if self.is_running_thread() {
+                if delay != 0 {
+                    self.block_current_thread_for_sleep(delay);
+                }
+                return Ok(DispatchResult::Yield);
+            }
+            if delay != 0 {
+                return Ok(DispatchResult::Sleep(delay));
+            }
+            return Ok(if self.scheduler.poll() {
+                DispatchResult::Yield
+            } else {
+                DispatchResult::Value(0)
+            });
+        }
         if library == "win32.kernel32.dll" && name == "WaitForSingleObject" {
             return Ok(DispatchResult::Wait(WaitRequest {
                 handle: arg(memory, sp, 0),
@@ -417,19 +497,15 @@ impl Runtime {
             .elapsed()
             .as_millis()
             .min(u128::from(u32::MAX)) as u32;
-        self.virtual_time = self.clock_offset.wrapping_add(elapsed);
+        self.virtual_time = elapsed;
         self.virtual_time
     }
 
-    fn advance_clock(&mut self, delta: u32) -> u32 {
-        let now = self.clock_now();
-        if delta == 0 {
-            return now;
-        }
-        self.clock_offset = now.wrapping_add(delta);
-        self.clock_origin = Instant::now();
-        self.virtual_time = self.clock_offset;
-        self.virtual_time
+    fn performance_counter(&self) -> u64 {
+        self.clock_origin
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64
     }
 
     fn poll_input(&mut self) {
@@ -622,30 +698,84 @@ impl Runtime {
         }
     }
 
-    pub fn wait_threads(&self, target: u32) -> Vec<u32> {
-        if let Some(owner) = self.background_critical_owner() {
-            return match self.handles.get(&owner) {
+    pub fn valid_wait_handle(&self, handle: u32) -> bool {
+        self.handles.contains_key(&handle)
+    }
+
+    pub fn block_current_thread(&mut self, request: &WaitRequest) {
+        let Some(handle) = self.current_thread else {
+            return;
+        };
+        let started = self.clock_now();
+        if let Some(Handle::Thread(thread)) = self.handles.get_mut(&handle) {
+            thread.wait = Some(ThreadWait::Handle {
+                handle: request.handle,
+                started,
+                timeout: request.timeout,
+            });
+            thread.resume_result = None;
+        }
+    }
+
+    fn block_current_thread_for_sleep(&mut self, duration: u32) {
+        let Some(handle) = self.current_thread else {
+            return;
+        };
+        let started = self.clock_now();
+        if let Some(Handle::Thread(thread)) = self.handles.get_mut(&handle) {
+            thread.wait = Some(ThreadWait::Sleep { started, duration });
+            thread.resume_result = None;
+        }
+    }
+
+    pub fn wait_threads(&mut self, target: u32) -> Vec<u32> {
+        let mut handles = if let Some(owner) = self.background_critical_owner() {
+            match self.handles.get(&owner) {
                 Some(Handle::Thread(thread)) if !thread.finished => vec![owner],
                 _ => Vec::new(),
+            }
+        } else {
+            self.handles
+                .iter()
+                .filter_map(|(handle, item)| match item {
+                    Handle::Thread(thread) if !thread.finished => Some(*handle),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        handles.sort_unstable_by_key(|handle| (*handle != target, *handle));
+
+        let now = self.clock_now();
+        let mut ready = Vec::new();
+        for handle in handles {
+            let wait = match self.handles.get(&handle) {
+                Some(Handle::Thread(thread)) => thread.wait.clone(),
+                _ => continue,
             };
-        }
-        if let Some(Handle::Thread(thread)) = self.handles.get(&target) {
-            return if thread.finished {
-                Vec::new()
-            } else {
-                vec![target]
+            let Some(wait) = wait else {
+                ready.push(handle);
+                continue;
             };
+            let resume_result = match &wait {
+                ThreadWait::Handle { handle, .. } => {
+                    if self.wait_immediate(*handle) {
+                        Some(0)
+                    } else {
+                        wait.timeout_result(now)
+                    }
+                }
+                ThreadWait::Sleep { .. } => wait.timeout_result(now),
+            };
+            let Some(resume_result) = resume_result else {
+                continue;
+            };
+            if let Some(Handle::Thread(thread)) = self.handles.get_mut(&handle) {
+                thread.wait = None;
+                thread.resume_result = Some(resume_result);
+                ready.push(handle);
+            }
         }
-        let mut handles = self
-            .handles
-            .iter()
-            .filter_map(|(handle, item)| match item {
-                Handle::Thread(thread) if !thread.finished => Some(*handle),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        handles.sort_unstable();
-        handles
+        ready
     }
 
     pub fn thread_contexts(&self) -> Vec<(u32, u32)> {
@@ -667,7 +797,7 @@ impl Runtime {
         {
             return None;
         }
-        let Handle::Thread(thread) = self.handles.get(&handle)? else {
+        let Handle::Thread(thread) = self.handles.get_mut(&handle)? else {
             return None;
         };
         if thread.finished {
@@ -678,10 +808,16 @@ impl Runtime {
             context: thread.context,
             start: thread.start,
             stack_top: thread.stack_top,
+            resume_result: thread.resume_result.take(),
             previous_thread: self.current_thread,
         };
+        self.scheduler.thread_slices = self.scheduler.thread_slices.wrapping_add(1);
         self.current_thread = Some(handle);
         Some(run)
+    }
+
+    pub fn scheduler_counters(&self) -> (u64, u64) {
+        (self.scheduler.handoffs, self.scheduler.thread_slices)
     }
 
     pub fn finish_thread_run(
@@ -990,6 +1126,40 @@ mod critical_section_tests {
         assert!(section.may_delete(0x202));
         assert!(!section.may_delete(0x101));
         Ok(())
+    }
+
+    #[test]
+    fn cooperative_scheduler_batches_main_thread_polls() {
+        let mut scheduler = CooperativeScheduler::new(3);
+        assert!(!scheduler.poll());
+        assert!(!scheduler.poll());
+        assert!(scheduler.poll());
+        assert_eq!(scheduler.handoffs, 1);
+        assert!(!scheduler.poll());
+    }
+
+    #[test]
+    fn thread_wait_deadlines_handle_clock_wraparound() {
+        let finite_wait = ThreadWait::Handle {
+            handle: 0x100,
+            started: u32::MAX - 5,
+            timeout: 10,
+        };
+        assert_eq!(finite_wait.timeout_result(3), None);
+        assert_eq!(finite_wait.timeout_result(4), Some(258));
+
+        let sleep = ThreadWait::Sleep {
+            started: u32::MAX - 5,
+            duration: 10,
+        };
+        assert_eq!(sleep.timeout_result(4), Some(0));
+
+        let infinite_wait = ThreadWait::Handle {
+            handle: 0x100,
+            started: 0,
+            timeout: u32::MAX,
+        };
+        assert_eq!(infinite_wait.timeout_result(u32::MAX), None);
     }
 }
 

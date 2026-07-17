@@ -70,6 +70,7 @@ impl RunnerOptions {
 
 struct HostState {
     runtime: Runtime,
+    memory: Option<Memory>,
 }
 
 pub fn run(
@@ -125,7 +126,13 @@ pub fn run(
     );
     runtime.reserve(STACK_TOP - 0x0010_0000, STACK_TOP + 0x0001_0000)?;
     runtime.register_manifest(&manifest);
-    let mut store = Store::new(&engine, HostState { runtime });
+    let mut store = Store::new(
+        &engine,
+        HostState {
+            runtime,
+            memory: None,
+        },
+    );
     let mut linker = Linker::new(&engine);
     register_imports(&module, &mut linker)?;
 
@@ -237,7 +244,6 @@ pub fn run(
         &event_tx,
         HostEvent::Status(String::from("Running — click the game surface to interact")),
     );
-
     let fps_interval = environment_u32("D2_FPS_LOG_MS")?
         .filter(|milliseconds| *milliseconds != 0)
         .map(|milliseconds| Duration::from_millis(u64::from(milliseconds)));
@@ -257,6 +263,8 @@ pub fn run(
     let mut fps_sample_round = 0u64;
     let mut fps_sample_blocks = 0u64;
     let mut fps_sample_count_hits = 0u32;
+    let (mut fps_sample_handoffs, mut fps_sample_thread_slices) =
+        store.data().runtime.scheduler_counters();
     let mut fps_status_counts = [0u64; 7];
     let mut round_pc_counts = HashMap::<u32, u64>::new();
     let mut profile_fuel_state = 0x6d2b_79f5u32;
@@ -323,6 +331,9 @@ pub fn run(
             let virtual_delta = virtual_ms.wrapping_sub(fps_sample_virtual_ms);
             let round_delta = rounds - fps_sample_round;
             let block_delta = executed_blocks - fps_sample_blocks;
+            let (handoffs, thread_slices) = store.data().runtime.scheduler_counters();
+            let handoff_delta = handoffs.saturating_sub(fps_sample_handoffs);
+            let thread_slice_delta = thread_slices.saturating_sub(fps_sample_thread_slices);
             let count_state =
                 if let (Some(address), Some(counter)) = (count_pc, count_hits.as_ref()) {
                     let hits = wt(counter.call(&mut store, ()))?;
@@ -373,6 +384,7 @@ pub fn run(
                  blocks={block_delta}, blocks_per_second={:.2}, \
                  statuses=[ok:{},fuel:{},missing:{},unsupported:{},trap:{},yield:{},other:{}], \
                  virtual_ms={virtual_delta}, clock_rate={:.2}x, \
+                 scheduler=[handoffs:{handoff_delta},thread_slices:{thread_slice_delta}], \
                  main={next_pc:#010x}/{last_pc:#010x}, threads=[{thread_state}], \
                  memory=[{memory_state}], count=[{count_state}]",
                 presentation_delta as f64 / elapsed,
@@ -410,6 +422,8 @@ pub fn run(
             fps_sample_virtual_ms = virtual_ms;
             fps_sample_round = rounds;
             fps_sample_blocks = executed_blocks;
+            fps_sample_handoffs = handoffs;
+            fps_sample_thread_slices = thread_slices;
             fps_status_counts.fill(0);
             round_pc_counts.clear();
         }
@@ -709,38 +723,40 @@ fn register_imports(module: &Module, linker: &mut Linker<HostState>) -> Result<(
                     import.name()
                 );
             };
-            Ok((
-                import.module().to_owned(),
-                import.name().to_owned(),
-                function_type,
-            ))
+            if function_type.params().len() != 1
+                || !function_type
+                    .params()
+                    .next()
+                    .is_some_and(|parameter| parameter.is_i32())
+                || function_type.results().len() != 1
+                || !function_type
+                    .results()
+                    .next()
+                    .is_some_and(|result| result.is_i32())
+            {
+                bail!(
+                    "unexpected host signature for {}!{}",
+                    import.module(),
+                    import.name()
+                );
+            }
+            Ok((import.module().to_owned(), import.name().to_owned()))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    for (library, name, function_type) in imports {
+    for (library, name) in imports {
         let callback_library = library.clone();
         let callback_name = name.clone();
-        wt(linker.func_new(
+        wt(linker.func_wrap(
             &library,
             &name,
-            function_type,
-            move |mut caller: Caller<'_, HostState>, parameters, results| {
-                if parameters.len() != 1 || results.len() != 1 {
-                    return Err(WasmtimeError::msg(format!(
-                        "unexpected host signature for {}!{}",
-                        callback_library, callback_name
-                    )));
-                }
-                let sp = match parameters[0] {
-                    Val::I32(value) => value as u32,
-                    _ => return Err(WasmtimeError::msg("host stack pointer is not i32")),
-                };
+            move |mut caller: Caller<'_, HostState>, sp: i32| {
                 let memory = exported_memory(&mut caller)?;
                 let outcome = {
                     let (bytes, state) = memory.data_and_store_mut(&mut caller);
                     state
                         .runtime
-                        .dispatch(&callback_library, &callback_name, sp, bytes)
+                        .dispatch(&callback_library, &callback_name, sp as u32, bytes)
                         .map_err(|error| WasmtimeError::msg(format!("{error:#}")))?
                 };
                 if callback_library == "win32.user32.dll"
@@ -784,9 +800,10 @@ fn register_imports(module: &Module, linker: &mut Linker<HostState>) -> Result<(
                         callback_result[0].unwrap_i32() as u32
                     }
                     DispatchResult::Wait(request) => run_wait(&mut caller, request)?,
+                    DispatchResult::Yield => run_yield(&mut caller)?,
+                    DispatchResult::Sleep(milliseconds) => run_sleep(&mut caller, milliseconds)?,
                 };
-                results[0] = Val::I32(value as i32);
-                Ok(())
+                Ok(value as i32)
             },
         ))?;
     }
@@ -859,64 +876,118 @@ fn run_wait(
     caller: &mut Caller<'_, HostState>,
     request: WaitRequest,
 ) -> Result<u32, WasmtimeError> {
+    if !caller.data().runtime.valid_wait_handle(request.handle) {
+        return Ok(u32::MAX);
+    }
     if caller.data().runtime.background_critical_owner().is_none()
         && caller.data_mut().runtime.wait_immediate(request.handle)
     {
         return Ok(0);
     }
     if caller.data().runtime.is_running_thread() {
+        if request.timeout == 0 {
+            return Ok(258);
+        }
+        caller.data_mut().runtime.block_current_thread(&request);
         call_export_void(caller, "d2_request_yield")?;
         return Ok(if request.timeout == u32::MAX { 0 } else { 258 });
     }
+    if request.timeout == 0 {
+        return Ok(258);
+    }
 
-    for round in 0..4096 {
-        let owner = caller.data().runtime.background_critical_owner();
-        if round >= 32 && owner.is_none() {
-            break;
+    let started = Instant::now();
+    loop {
+        let ran = run_ready_threads(caller, request.handle)?;
+        if caller.data().runtime.background_critical_owner().is_none()
+            && caller.data_mut().runtime.wait_immediate(request.handle)
+        {
+            return Ok(0);
         }
-        let threads = caller.data().runtime.wait_threads(request.handle);
-        if threads.is_empty() {
-            if let Some(owner) = owner {
-                return Err(WasmtimeError::msg(format!(
-                    "thread {owner:#x} stopped while owning a critical section"
-                )));
-            }
-            break;
+        if request.timeout != u32::MAX
+            && started.elapsed() >= Duration::from_millis(u64::from(request.timeout))
+        {
+            return Ok(258);
         }
-        for handle in &threads {
-            let Some(run) = caller.data_mut().runtime.begin_thread_run(*handle) else {
-                continue;
+        if ran == 0 {
+            let delay = if request.timeout == u32::MAX {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(1).min(
+                    Duration::from_millis(u64::from(request.timeout))
+                        .saturating_sub(started.elapsed()),
+                )
             };
-            let outcome = run_thread(caller, &run);
-            match outcome {
-                Ok((exit_code, status, finished)) => caller
-                    .data_mut()
-                    .runtime
-                    .finish_thread_run(&run, exit_code, status, finished),
-                Err(error) => {
-                    caller.data_mut().runtime.abort_thread_run(&run);
-                    return Err(error);
-                }
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
             }
-            if caller.data().runtime.background_critical_owner().is_none()
-                && caller.data_mut().runtime.wait_immediate(request.handle)
-            {
-                return Ok(0);
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+fn run_yield(caller: &mut Caller<'_, HostState>) -> Result<u32, WasmtimeError> {
+    if caller.data().runtime.is_running_thread() {
+        call_export_void(caller, "d2_request_yield")?;
+        return Ok(0);
+    }
+
+    run_ready_threads(caller, 0)?;
+    Ok(0)
+}
+
+fn run_sleep(caller: &mut Caller<'_, HostState>, milliseconds: u32) -> Result<u32, WasmtimeError> {
+    let duration = Duration::from_millis(u64::from(milliseconds));
+    let started = Instant::now();
+    loop {
+        let ran = run_ready_threads(caller, 0)?;
+        let remaining = duration.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(0);
+        }
+        if ran == 0 {
+            std::thread::sleep(Duration::from_millis(1).min(remaining));
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+fn run_ready_threads(
+    caller: &mut Caller<'_, HostState>,
+    target: u32,
+) -> Result<usize, WasmtimeError> {
+    let threads = caller.data_mut().runtime.wait_threads(target);
+    let mut ran = 0;
+    for handle in threads {
+        let Some(run) = caller.data_mut().runtime.begin_thread_run(handle) else {
+            continue;
+        };
+        ran += 1;
+        match run_thread(caller, &run) {
+            Ok((exit_code, status, finished)) => caller
+                .data_mut()
+                .runtime
+                .finish_thread_run(&run, exit_code, status, finished),
+            Err(error) => {
+                caller.data_mut().runtime.abort_thread_run(&run);
+                return Err(error);
             }
         }
     }
-    if let Some(owner) = caller.data().runtime.background_critical_owner() {
-        return Err(WasmtimeError::msg(format!(
-            "critical section owner {owner:#x} did not release after 4096 scheduler rounds"
-        )));
-    }
-    Ok(if request.timeout == 0 { 258 } else { 0 })
+    Ok(ran)
 }
 
 fn run_thread(
     caller: &mut Caller<'_, HostState>,
     run: &ThreadRun,
 ) -> Result<(u32, u32, bool), WasmtimeError> {
+    if let Some(result) = run.resume_result {
+        let memory = exported_memory(caller)?;
+        write_u32(memory.data_mut(&mut *caller), run.context + 64, result)
+            .map_err(|error| WasmtimeError::msg(format!("{error:#}")))?;
+    }
     let exit_code = call_export_u32(
         caller,
         "d2_run_context",
@@ -959,10 +1030,15 @@ fn call_export_void(caller: &mut Caller<'_, HostState>, name: &str) -> Result<()
 }
 
 fn exported_memory(caller: &mut Caller<'_, HostState>) -> wasmtime::Result<Memory> {
-    caller
+    if let Some(memory) = caller.data().memory {
+        return Ok(memory);
+    }
+    let memory = caller
         .get_export("memory")
         .and_then(Extern::into_memory)
-        .ok_or_else(|| WasmtimeError::msg("translated module memory is unavailable"))
+        .ok_or_else(|| WasmtimeError::msg("translated module memory is unavailable"))?;
+    caller.data_mut().memory = Some(memory);
+    Ok(memory)
 }
 
 fn ensure_memory(memory: &Memory, store: &mut Store<HostState>, required: usize) -> Result<()> {

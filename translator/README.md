@@ -183,6 +183,17 @@ semicolons, for example `D2_AUTO_KEYS='67,1500'` to press `C` at presentation
 Set `D2_WATCH_PC` to a lifted basic-block address and
 `D2_STOP_ON_WATCH=1` to yield with its guest registers and stack intact.
 
+The native host cooperatively schedules translated thread contexts at Win32
+waits and periodically at main-thread `Sleep(0)` calls. The default batches 256
+zero-sleeps per handoff so polling loops cannot starve wait-ready worker
+threads without scheduling a worker on every poll. Set
+`D2_COOPERATIVE_POLL_INTERVAL` to tune that batch size. Nonzero sleeps use wall
+time, while sleeping and waiting worker contexts remain blocked until their
+deadline or event is ready.
+`GetTickCount` and `timeGetTime` retain millisecond wall-clock semantics;
+`QueryPerformanceCounter` uses a matching nanosecond-resolution monotonic
+frequency so sub-millisecond guest work is still measurable.
+
 ### Record and replay native gameplay
 
 Record mouse, keyboard, and window-close input together with a verification

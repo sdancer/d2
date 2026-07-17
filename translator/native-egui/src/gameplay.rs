@@ -239,6 +239,9 @@ impl GameplaySession {
         height: usize,
         framebuffer: &[u8],
     ) -> Result<()> {
+        if matches!(self.journal, Journal::Disabled) {
+            return Ok(());
+        }
         let framebuffer_fnv1a64 = hash_bytes(framebuffer);
         match &mut self.journal {
             Journal::Disabled => Ok(()),
