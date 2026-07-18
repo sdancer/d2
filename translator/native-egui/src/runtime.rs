@@ -124,6 +124,12 @@ struct SoundBuffer {
 }
 
 #[derive(Debug)]
+struct ComObject {
+    vtable: u32,
+    references: u32,
+}
+
+#[derive(Debug)]
 struct FileHandle {
     file: File,
     path: PathBuf,
@@ -391,6 +397,7 @@ pub struct Runtime {
     virtual_time: u32,
     clock_origin: Instant,
     direct_sound_objects: HashSet<u32>,
+    com_objects: HashMap<u32, ComObject>,
     audio_output_enabled: bool,
     sound_buffers: HashMap<u32, SoundBuffer>,
     next_sound_id: u32,
@@ -500,6 +507,7 @@ impl Runtime {
             virtual_time: 0,
             clock_origin: Instant::now(),
             direct_sound_objects: HashSet::new(),
+            com_objects: HashMap::new(),
             audio_output_enabled: std::env::var("D2_DISABLE_SOUND")
                 .map(|value| !matches!(value.trim(), "1" | "true" | "yes"))
                 .unwrap_or(true),

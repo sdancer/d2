@@ -14,7 +14,10 @@ impl Runtime {
                 }
                 let object = self.create_com_object(memory, 0, 11)?;
                 self.direct_sound_objects.insert(object);
-                write_u32(memory, output, object)?;
+                if let Err(error) = write_u32(memory, output, object) {
+                    self.release_com_object(object);
+                    return Err(error);
+                }
                 Ok(0)
             }
             _ => Ok(self.unknown("win32.dsound.dll", name, 0)),
@@ -32,14 +35,17 @@ impl Runtime {
             let relative = if method >= 32 { method - 32 } else { method };
             return match relative {
                 0 => {
+                    if self.add_com_reference(object).is_none() {
+                        return Ok(DSERR_INVALIDCALL);
+                    }
                     let output = arg(memory, sp, 2);
                     if output != 0 {
                         write_u32(memory, output, object)?;
                     }
                     Ok(0)
                 }
-                1 => Ok(2),
-                _ => Ok(1),
+                1 => Ok(self.add_com_reference(object).unwrap_or(0)),
+                _ => Ok(self.release_com_object(object)),
             };
         }
         if method < 32 {
@@ -62,9 +68,57 @@ impl Runtime {
                 DSOUND_PC_BASE + (method_base + method) * 4,
             )?;
         }
-        let object = self.alloc(memory, 4, 4)?;
-        write_u32(memory, object, vtable)?;
+        let object = match self.alloc(memory, 4, 4) {
+            Ok(object) => object,
+            Err(error) => {
+                self.free(vtable);
+                return Err(error);
+            }
+        };
+        if let Err(error) = write_u32(memory, object, vtable) {
+            self.free(object);
+            self.free(vtable);
+            return Err(error);
+        }
+        self.com_objects.insert(
+            object,
+            ComObject {
+                vtable,
+                references: 1,
+            },
+        );
         Ok(object)
+    }
+
+    fn add_com_reference(&mut self, object: u32) -> Option<u32> {
+        let allocation = self.com_objects.get_mut(&object)?;
+        allocation.references = allocation.references.saturating_add(1);
+        Some(allocation.references)
+    }
+
+    fn release_com_object(&mut self, object: u32) -> u32 {
+        let Some(allocation) = self.com_objects.get_mut(&object) else {
+            return 0;
+        };
+        if allocation.references > 1 {
+            allocation.references -= 1;
+            return allocation.references;
+        }
+        let allocation = self.com_objects.remove(&object).expect("checked above");
+        self.direct_sound_objects.remove(&object);
+        if let Some(buffer) = self.sound_buffers.remove(&object) {
+            if self.audio_output_enabled {
+                let _ = self
+                    .event_tx
+                    .try_send(HostEvent::AudioStop { id: buffer.id });
+            }
+            if buffer.bytes != 0 {
+                self.free(buffer.bytes);
+            }
+        }
+        self.free(object);
+        self.free(allocation.vtable);
+        0
     }
 
     fn read_wave_format(&self, memory: &[u8], pointer: u32) -> Result<WaveFormat> {
@@ -145,7 +199,13 @@ impl Runtime {
                 let bytes = if primary || size == 0 {
                     0
                 } else {
-                    self.alloc(memory, size, 16)?
+                    match self.alloc(memory, size, 16) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            self.release_com_object(buffer_object);
+                            return Err(error);
+                        }
+                    }
                 };
                 let id = self.next_sound_id;
                 self.next_sound_id += 1;
@@ -166,7 +226,10 @@ impl Runtime {
                         play_started: 0,
                     },
                 );
-                write_u32(memory, output, buffer_object)?;
+                if let Err(error) = write_u32(memory, output, buffer_object) {
+                    self.release_com_object(buffer_object);
+                    return Err(error);
+                }
             }
             4 => {
                 let output = arg(memory, sp, 1);

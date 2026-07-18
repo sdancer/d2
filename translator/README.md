@@ -230,12 +230,16 @@ input is ignored during replay except for closing the window.
 ## Chrome host
 
 The browser harness runs the same linked Wasm and JavaScript Win32 boundary in
-a module Web Worker. It uploads the guest's 32-bit software framebuffer to a
-WebGL2 texture (with a Canvas2D fallback), keeps an 800x600 `OffscreenCanvas`
+a module Web Worker. By default it uploads the guest's 32-bit D2Gdi software
+framebuffer to WebGL2, with a Canvas2D fallback; `?renderer=glide` selects the
+experimental Glide3x-to-WebGL2 adapter. It keeps an 800x600 `OffscreenCanvas`
 while scaling the 640x480 in-game renderer, and forwards mouse, wheel,
 character, and keyboard input. Guest DirectSound ring buffers are streamed to
 Web Audio, including live lock/unlock writes, playback position, volume, pan,
-frequency, and stop updates.
+frequency, and stop updates. Cooperative guest waits remain resumable while
+the worker yields to Chrome, and Win32 timing is derived from the host wall
+clock with a nanosecond-frequency performance counter that retains
+sub-millisecond precision.
 Game data and initial saves are fetched into a synchronous in-memory filesystem
 before execution begins; browser writes are currently session-local.
 
@@ -263,10 +267,8 @@ locations when the build lives elsewhere:
 ```
 
 Chrome requires `OffscreenCanvas`; current Chromium/Chrome releases provide it.
-WebGL2 accelerates presentation of D2Gdi's software output; this does not yet
-implement the guest DirectDraw/Direct3D COM or Glide driver interfaces. The
-included server also supplies the cross-origin isolation and Wasm MIME headers
-expected by the worker.
+The included server also supplies the cross-origin isolation and Wasm MIME
+headers expected by the worker.
 
 ## SQLite lifted-code debug database
 

@@ -25,10 +25,35 @@ let stagingSurface;
 let stagingContext;
 let frame;
 let lastRenderAt = -Infinity;
+let performanceStarted = 0;
+let performanceRounds = 0;
+let performancePresentations = 0;
+let performanceGuestClock = 0;
 
 const send = (type, detail = {}) => postMessage({ type, ...detail });
 const delay = () => new Promise((resolve) => setTimeout(resolve, 0));
 const hex = (value) => `0x${(value >>> 0).toString(16).padStart(8, "0")}`;
+
+function samplePerformance(status) {
+  if (!runtime) return;
+  const now = performance.now();
+  const elapsed = now - performanceStarted;
+  if (elapsed < 1000) return;
+  const presentations = runtime.screenPresentations;
+  const guestClock = runtime.clockNow();
+  const fps = (presentations - performancePresentations) * 1000 / elapsed;
+  const roundsPerSecond = (rounds - performanceRounds) * 1000 / elapsed;
+  const clockRate = ((guestClock - performanceGuestClock) >>> 0) / elapsed;
+  send("state", {
+    message: `Running · ${fps.toFixed(1)} fps · ${roundsPerSecond.toFixed(1)} rounds/s · `
+      + `clock ${clockRate.toFixed(2)}x · presentation ${presentations} · status ${status} · `
+      + `scheduler ${runtime.schedulerHandoffs}/${runtime.schedulerThreadSlices}`,
+  });
+  performanceStarted = now;
+  performanceRounds = rounds;
+  performancePresentations = presentations;
+  performanceGuestClock = guestClock;
+}
 
 function createWebGlPresenter(canvas) {
   const gl = canvas.getContext("webgl2", {
@@ -255,7 +280,7 @@ function drainEvents() {
   }
 }
 
-async function initialize(canvas, demo, diagnostics = false, requestedRenderer = "glide", soundEnabled = false) {
+async function initialize(canvas, demo, diagnostics = false, requestedRenderer = "gdi", soundEnabled = false) {
   surface = canvas;
   surface.width = 800;
   surface.height = 600;
@@ -325,9 +350,7 @@ async function initialize(canvas, demo, diagnostics = false, requestedRenderer =
   let environment = {};
   if (demo && config.savedCharacters.length) {
     environment = {
-      D2_AUTO_CLICKS: renderer === "glide"
-        ? "400,208,500;550,300,800;420,560,1100"
-        : "400,208,700;550,300,1600;420,560,2600",
+      D2_AUTO_CLICKS: "400,208,500;550,300,800;420,560,1100",
     };
   } else if (demo) {
     environment = {
@@ -398,6 +421,10 @@ async function initialize(canvas, demo, diagnostics = false, requestedRenderer =
   }
 
   context = runtime.alloc(256, 8);
+  performanceStarted = performance.now();
+  performanceRounds = rounds;
+  performancePresentations = runtime.screenPresentations;
+  performanceGuestClock = runtime.clockNow();
   running = true;
   send("ready", { message: "Browser host initialized; mouse and keyboard input are live." });
   await run(translation.entry_va);
@@ -410,12 +437,21 @@ async function run(entry) {
       await new Promise((resolve) => setTimeout(resolve, 20));
       continue;
     }
-    const wait = runtime.mainResumeAt - runtime.clockNow();
-    if (wait > 0) {
-      await new Promise((resolve) => setTimeout(resolve, Math.min(wait, 20)));
-      continue;
+    const criticalOwner = runtime.backgroundCriticalOwner();
+    if (runtime.mainWait || criticalOwner !== null) {
+      const target = runtime.mainWait?.type === "handle"
+        ? runtime.mainWait.handle
+        : criticalOwner ?? 0;
+      const ran = runtime.runPendingThreads(THREAD_FUEL_PER_ROUND, target);
+      const mainReady = runtime.resolveMainWait(context);
+      drainEvents();
+      samplePerformance(status);
+      if (!mainReady || runtime.backgroundCriticalOwner() !== null) {
+        const wait = ran ? 0 : runtime.schedulerDelay();
+        await new Promise((resolve) => setTimeout(resolve, wait));
+        continue;
+      }
     }
-    runtime.mainResumeAt = 0;
     const result = instance.exports.d2_run_context(
       context,
       entry,
@@ -426,7 +462,8 @@ async function run(entry) {
     status = instance.exports.d2_context_status(context) >>> 0;
     rounds++;
     drainEvents();
-    if (rounds % 10 === 0) {
+    samplePerformance(status);
+    if (rounds % 250 === 0) {
       const view = new DataView(instance.exports.memory.buffer);
       const next = view.getUint32(context + 12, true);
       const last = view.getUint32(context + 16, true);
@@ -443,6 +480,7 @@ async function run(entry) {
           + `input ${runtime.autoClickIndex} · queue ${runtime.messageQueue.length} · `
           + `threads ${pendingThreads.length}`
           + (thread ? ` (${hex(thread.start)} → ${hex(threadNext)})` : "")
+          + ` · scheduler ${runtime.schedulerHandoffs}/${runtime.schedulerThreadSlices}`
           + ` · next ${hex(next)} · last ${hex(last)} · tick ${hex(tick)} · `
           + `status ${status}`,
       });
@@ -536,6 +574,10 @@ function diagnosticSnapshot() {
       last: read(context + 16),
       previous: read(context + 20),
       esp,
+      registers: Object.fromEntries(
+        ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"]
+          .map((name, index) => [name, read(context + 64 + index * 4)]),
+      ),
       stack: Array.from({ length: 32 }, (_value, index) => read(esp + index * 4)),
     },
     windows,

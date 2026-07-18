@@ -6,6 +6,7 @@ let now = 0;
 const runtime = new Win32Runtime({
   hostRoot: fileURLToPath(new URL(".", import.meta.url)),
   clock: () => now,
+  performanceCounterOrigin: 2 ** 53,
   diagnostics: true,
 });
 runtime.attach(memory);
@@ -27,6 +28,24 @@ const view = () => new DataView(memory.buffer);
 const setArgs = (...values) => values.forEach((value, index) => view().setUint32(stack + index * 4, value >>> 0, true));
 
 if (kernel32.GetTickCount() !== 0 || winmm.timeGetTime() !== 0) throw new Error("clock reads must not advance time");
+const performanceFrequency = runtime.alloc(8, 8);
+const performanceValue = runtime.alloc(8, 8);
+setArgs(performanceFrequency);
+if (!kernel32.QueryPerformanceFrequency(stack)
+    || view().getBigUint64(performanceFrequency, true) !== 1_000_000_000n) {
+  throw new Error("performance counter frequency is not nanosecond-based");
+}
+setArgs(performanceValue);
+kernel32.QueryPerformanceCounter(stack);
+const performanceBefore = view().getBigUint64(performanceValue, true);
+if (performanceBefore !== BigInt(2 ** 53)) {
+  throw new Error("performance counter did not preserve its stable nonzero origin");
+}
+now = 0.25;
+kernel32.QueryPerformanceCounter(stack);
+if (view().getBigUint64(performanceValue, true) - performanceBefore !== 250_000n) {
+  throw new Error("performance counter lost sub-millisecond precision");
+}
 now = 16;
 if (kernel32.GetTickCount() !== 16 || winmm.timeGetTime() !== 16) throw new Error("clock did not follow elapsed host time");
 setArgs(100);
@@ -99,6 +118,7 @@ if (runtime.cursorX !== 639 || runtime.cursorY !== 479) throw new Error("input w
 let cooperativeYields = 0;
 runtime.cooperativeTiming = true;
 runtime.yieldOnPresent = true;
+runtime.schedulerPollInterval = 2;
 runtime.exports = { d2_request_yield: () => { cooperativeYields++; } };
 setArgs(screenDc, 0, 0, 640, 480, sourceDc, 0, 0, 0x00cc0020);
 gdi32.BitBlt(stack);
@@ -112,14 +132,85 @@ if (cooperativeYields !== 1) {
 setArgs(0);
 kernel32.Sleep(stack);
 if (cooperativeYields !== 1 || runtime.mainResumeAt !== 0) {
-  throw new Error("screen presentation did not yield without delaying Sleep(0)");
+  throw new Error("the first Sleep(0) should remain in the main slice");
+}
+kernel32.Sleep(stack);
+if (cooperativeYields !== 2 || runtime.schedulerHandoffs !== 1) {
+  throw new Error("Sleep(0) did not periodically hand off to worker threads");
 }
 setArgs(7);
 const beforeTimedSleep = runtime.clockNow();
 kernel32.Sleep(stack);
-if (cooperativeYields !== 2 || runtime.mainResumeAt !== beforeTimedSleep + 7) {
+if (cooperativeYields !== 3
+    || runtime.mainResumeAt !== beforeTimedSleep + 7
+    || runtime.clockNow() !== beforeTimedSleep) {
   throw new Error("timed cooperative sleep was not scheduled against the host clock");
 }
+const mainContext = runtime.alloc(256, 8);
+now += 6;
+if (runtime.resolveMainWait(mainContext)) throw new Error("timed sleep resumed too early");
+now += 1;
+if (!runtime.resolveMainWait(mainContext)
+    || view().getUint32(mainContext + 64, true) !== 0) {
+  throw new Error("timed sleep did not resume with its Win32 result");
+}
+
+setArgs(0, 0, 0, 0);
+const waitEvent = kernel32.CreateEventA(stack);
+setArgs(waitEvent, 0xffffffff);
+if (kernel32.WaitForSingleObject(stack) !== 0 || runtime.mainWait) {
+  throw new Error("main-thread event wait did not use the browser compatibility path");
+}
+setArgs(waitEvent);
+kernel32.SetEvent(stack);
+setArgs(waitEvent, 0xffffffff);
+if (kernel32.WaitForSingleObject(stack) !== 0
+    || runtime.handles.get(waitEvent).signaled) {
+  throw new Error("main-thread event wait did not consume the auto-reset signal");
+}
+
+setArgs(0, 0x10000, 0x12345678, 0, 0, 0);
+const workerHandle = kernel32.CreateThread(stack);
+const worker = runtime.handles.get(workerHandle);
+runtime.currentThread = worker;
+setArgs(waitEvent, 10);
+if (kernel32.WaitForSingleObject(stack) !== 258 || !worker.wait) {
+  throw new Error("worker timeout was not suspended");
+}
+runtime.currentThread = null;
+let workerResumeResult = null;
+runtime.exports = {
+  d2_request_yield: () => { cooperativeYields++; },
+  d2_run_context: (workerContext) => {
+    workerResumeResult = view().getUint32(workerContext + 64, true);
+    return 0;
+  },
+  d2_context_status: () => 5,
+  d2_context_finished: () => 0,
+};
+now += 10;
+if (runtime.runPendingThreads() !== 1 || workerResumeResult !== 258) {
+  throw new Error("worker wait timeout result was not restored to EAX");
+}
+
+const criticalSection = runtime.alloc(24, 4);
+setArgs(criticalSection);
+kernel32.InitializeCriticalSection(stack);
+kernel32.EnterCriticalSection(stack);
+kernel32.EnterCriticalSection(stack);
+if (view().getUint32(criticalSection + 8, true) !== 2
+    || view().getUint32(criticalSection + 12, true) !== 1) {
+  throw new Error("main critical section recursion was not tracked");
+}
+kernel32.LeaveCriticalSection(stack);
+kernel32.LeaveCriticalSection(stack);
+runtime.currentThread = worker;
+kernel32.EnterCriticalSection(stack);
+if (runtime.backgroundCriticalOwner() !== workerHandle) {
+  throw new Error("background critical section ownership was not exposed to the scheduler");
+}
+kernel32.LeaveCriticalSection(stack);
+runtime.currentThread = null;
 runtime.cooperativeTiming = false;
 runtime.yieldOnPresent = false;
 runtime.exports = null;
@@ -253,4 +344,4 @@ if (dsound.__dispatch(50, stack) !== 0 || audioEvent?.type !== "stop") {
   throw new Error("DirectSound stop was not emitted");
 }
 
-console.log("direct Win32 runtime clock, viewport, Glide, audio, formatting, cursor, file, and browser input adapters passed");
+console.log("direct Win32 runtime clock, cooperative scheduler, viewport, Glide, audio, formatting, cursor, file, and browser input adapters passed");

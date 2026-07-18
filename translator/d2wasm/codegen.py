@@ -76,6 +76,7 @@ _OPTIONAL_FLAG_MNEMONICS = {
     "xor",
 }
 
+
 def host_thunk_pc(key: str) -> int:
     value = 0x811C9DC5
     for byte in key.lower().encode("utf-8"):
@@ -1136,13 +1137,16 @@ static uint32_t d2_dsound_arg_bytes(uint32_t method) {
 ''' if has_dsound else ""
     dsound_dispatch = r'''
   if (pc >= D2_DSOUND_PC_BASE && pc < D2_DSOUND_PC_BASE + 53u * 4u) {
+    D2_BEGIN_BLOCK(pc, block_fuel);
     uint32_t method = (pc - D2_DSOUND_PC_BASE) / 4u;
     uint32_t return_pc = load32(esp);
     eax = api_dsound_dispatch(method, esp + 4u);
     esp += 4u + d2_dsound_arg_bytes(method);
     d2_next_pc = return_pc;
     if (return_pc == D2_RETURN_SENTINEL) { d2_status = D2_STATUS_OK; return D2_ACTION_RETURN; }
-    return D2_ACTION_CONTINUE;
+    if (d2_yield_requested || !*block_fuel) return D2_ACTION_CONTINUE;
+    pc = d2_next_pc;
+    continue;
   }
 ''' if has_dsound else ""
     return (
@@ -1454,9 +1458,9 @@ static inline uint32_t rotate_value(uint32_t value, uint32_t count, uint32_t bit
 __attribute__((noinline))
 static uint32_t d2_dispatch_block(uint32_t pc, uint32_t *block_fuel) {
   for (;;) {
+@DSOUND_DISPATCH@
     if (pc >= 0x@HOST_THUNK_BASE@u) {
       D2_BEGIN_BLOCK(pc, block_fuel);
-@DSOUND_DISPATCH@
 @HOST_THUNK_DISPATCH@
       d2_status = D2_STATUS_MISSING_BLOCK;
       return D2_ACTION_RETURN;

@@ -14,6 +14,7 @@ export class Win32Runtime {
     this.cooperativeTiming = options.cooperativeTiming ?? false;
     this.yieldOnPresent = options.yieldOnPresent ?? false;
     this.mainResumeAt = 0;
+    this.mainWait = null;
     this.commandLine = options.commandLine ?? '"C:\\Diablo II\\Diablo II.exe" -w';
     this.moduleFilename = options.moduleFilename ?? "C:\\Diablo II\\Diablo II.exe";
     this.heapCursor = options.heapBase ?? 0x00800000;
@@ -30,6 +31,12 @@ export class Win32Runtime {
     this.clock = options.clock ?? (() => performance.now());
     this.clockOrigin = this.clock();
     this.clockOffset = this.virtualTime;
+    const defaultCounterOrigin = options.clock === undefined
+      ? Math.max(0, globalThis.performance?.timeOrigin ?? Date.now()) * 1_000_000
+      : 0;
+    this.performanceCounterOrigin = BigInt(Math.trunc(
+      options.performanceCounterOrigin ?? defaultCounterOrigin,
+    ));
     this.epochMilliseconds = options.epochMilliseconds ?? Date.UTC(2000, 0, 1);
     this.showCursorCount = 0;
     this.currentDirectory = options.currentDirectory ?? "C:\\Diablo II";
@@ -39,6 +46,16 @@ export class Win32Runtime {
     this.nextHandle = 0x100;
     this.handles = new Map();
     this.currentThread = null;
+    this.criticalSections = new Map();
+    this.schedulerPolls = 0;
+    this.schedulerHandoffs = 0;
+    this.schedulerThreadSlices = 0;
+    this.schedulerPollInterval = Math.max(
+      1,
+      Number(options.schedulerPollInterval
+        ?? this.environment.D2_COOPERATIVE_POLL_INTERVAL
+        ?? 256) || 256,
+    );
     this.schedulerEvents = [];
     this.fileIoEvents = [];
     this.apiCounts = new Map();
@@ -214,6 +231,12 @@ export class Win32Runtime {
     this.clockOrigin = this.clock();
     this.virtualTime = this.clockOffset;
     return this.virtualTime;
+  }
+
+  performanceCounter() {
+    const elapsed = Math.max(0, this.clock() - this.clockOrigin);
+    return this.performanceCounterOrigin
+      + BigInt(Math.max(0, Math.trunc((this.clockOffset + elapsed) * 1_000_000)));
   }
 
   createComObject(methodBase, methodCount) {
@@ -728,6 +751,10 @@ export class Win32Runtime {
     const previous = this.currentThread;
     this.currentThread = thread;
     try {
+      if (thread.resumeResult !== undefined && thread.resumeResult !== null) {
+        this.view().setUint32(thread.context + 64, thread.resumeResult >>> 0, true);
+        thread.resumeResult = null;
+      }
       thread.exitCode = this.exports.d2_run_context(
         thread.context,
         thread.start,
@@ -736,7 +763,8 @@ export class Win32Runtime {
       ) >>> 0;
       thread.status = this.exports.d2_context_status(thread.context) >>> 0;
       thread.finished = Boolean(this.exports.d2_context_finished(thread.context));
-      if (this.exports.d2_context_watch_hit(thread.context)) {
+      this.schedulerThreadSlices++;
+      if (this.exports.d2_context_watch_hit?.(thread.context)) {
         const names = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"];
         this.threadWatchEvents ??= [];
         this.threadWatchEvents.push({
@@ -759,19 +787,101 @@ export class Win32Runtime {
     }
   }
 
-  runPendingThreads(fuel = 50_000) {
-    const now = this.clockNow();
-    const pending = Array.from(this.handles.values())
-      .filter((item) => item.type === "thread" && !item.finished)
-      .filter((thread) => {
-        if (!this.cooperativeTiming || !thread.resumeAt || thread.resumeAt <= now) return true;
-        return thread.waitHandle && this.handles.get(thread.waitHandle)?.signaled;
-      });
-    for (const thread of pending) {
-      thread.resumeAt = 0;
-      thread.waitHandle = 0;
-      this.runThread(thread, fuel);
+  waitImmediate(handle) {
+    const target = this.handles.get(handle);
+    if (target?.type === "event" && target.signaled) {
+      if (!target.manualReset) target.signaled = false;
+      return true;
     }
+    return target?.type === "thread" && target.finished;
+  }
+
+  waitTimeoutResult(wait, now = this.clockNow()) {
+    const elapsed = (now - wait.started) >>> 0;
+    if (wait.type === "sleep") return elapsed >= wait.duration ? 0 : null;
+    if (wait.timeout !== 0xffffffff && elapsed >= wait.timeout) return 258;
+    return null;
+  }
+
+  backgroundCriticalOwner() {
+    let owner = null;
+    for (const section of this.criticalSections.values()) {
+      if (section.owner <= 1) continue;
+      const thread = this.handles.get(section.owner);
+      if (thread?.type === "thread" && !thread.finished
+          && (owner === null || section.owner < owner)) owner = section.owner;
+    }
+    return owner;
+  }
+
+  readyThreadHandles(targetHandle = 0) {
+    const now = this.clockNow();
+    const owner = this.backgroundCriticalOwner();
+    const threads = owner === null
+      ? Array.from(this.handles.values())
+        .filter((item) => item.type === "thread" && !item.finished)
+      : [this.handles.get(owner)].filter(Boolean);
+    threads.sort((left, right) => {
+      const leftOrder = left.handle === targetHandle ? 0 : 1;
+      const rightOrder = right.handle === targetHandle ? 0 : 1;
+      return leftOrder - rightOrder || left.handle - right.handle;
+    });
+    return threads.filter((thread) => {
+      if (!thread.wait) return true;
+      let result = null;
+      if (thread.wait.type === "handle" && this.waitImmediate(thread.wait.handle)) result = 0;
+      else result = this.waitTimeoutResult(thread.wait, now);
+      if (result === null) return false;
+      thread.wait = null;
+      thread.resumeResult = result;
+      return true;
+    });
+  }
+
+  runPendingThreads(fuel = 50_000, targetHandle = 0) {
+    let ran = 0;
+    for (const thread of this.readyThreadHandles(targetHandle)) {
+      this.runThread(thread, fuel);
+      ran++;
+    }
+    return ran;
+  }
+
+  requestYield() {
+    this.exports?.d2_request_yield?.();
+  }
+
+  resolveMainWait(context) {
+    const wait = this.mainWait;
+    if (!wait) return true;
+    let result = null;
+    if (wait.type === "handle"
+        && this.backgroundCriticalOwner() === null
+        && this.waitImmediate(wait.handle)) result = 0;
+    else result = this.waitTimeoutResult(wait);
+    if (result === null) return false;
+    if (context && this.memory) this.view().setUint32(context + 64, result >>> 0, true);
+    this.mainWait = null;
+    this.mainResumeAt = 0;
+    return true;
+  }
+
+  schedulerDelay(maximum = 20) {
+    const waits = [];
+    if (this.mainWait) waits.push(this.mainWait);
+    for (const item of this.handles.values()) {
+      if (item.type === "thread" && !item.finished && item.wait) waits.push(item.wait);
+    }
+    let delay = maximum;
+    const now = this.clockNow();
+    for (const wait of waits) {
+      if (wait.type === "handle" && this.handles.get(wait.handle)?.signaled) return 0;
+      const duration = wait.type === "sleep" ? wait.duration : wait.timeout;
+      if (duration === 0xffffffff) continue;
+      const elapsed = (now - wait.started) >>> 0;
+      delay = Math.min(delay, Math.max(0, duration - elapsed));
+    }
+    return delay;
   }
 
   sleep(milliseconds) {
@@ -780,16 +890,26 @@ export class Win32Runtime {
       return 0;
     }
     if (!milliseconds) {
-      // The game's main loop calls Sleep(0) twice per iteration. A browser
-      // timer here clamps the loop to a few frames per second; presentation
-      // itself is already the cooperative compositor boundary.
-      if (this.currentThread) this.exports?.d2_request_yield?.();
+      if (this.currentThread) this.requestYield();
+      else {
+        this.schedulerPolls++;
+        if (this.schedulerPolls % this.schedulerPollInterval === 0) {
+          this.schedulerHandoffs++;
+          this.requestYield();
+        }
+      }
       return 0;
     }
-    const resumeAt = this.clockNow() + (milliseconds >>> 0);
-    if (this.currentThread) this.currentThread.resumeAt = resumeAt;
-    else this.mainResumeAt = resumeAt;
-    this.exports?.d2_request_yield?.();
+    const started = this.clockNow();
+    const wait = { type: "sleep", started, duration: milliseconds >>> 0 };
+    if (this.currentThread) {
+      this.currentThread.wait = wait;
+      this.currentThread.resumeResult = null;
+    } else {
+      this.mainWait = wait;
+      this.mainResumeAt = (started + (milliseconds >>> 0)) >>> 0;
+    }
+    this.requestYield();
     return 0;
   }
 
@@ -802,31 +922,33 @@ export class Win32Runtime {
       });
       if (this.schedulerEvents.length > 128) this.schedulerEvents.shift();
     }
-    const consumeSignal = () => {
-      if (!target?.signaled) return false;
-      if (target.type === "event" && !target.manualReset) target.signaled = false;
-      return true;
-    };
-    if (consumeSignal() || target?.type === "thread" && target.finished) return 0;
+    if (!target) return 0xffffffff;
+    if (this.backgroundCriticalOwner() === null && this.waitImmediate(handle)) return 0;
     if (timeout === 0) return 258;
-    if (this.currentThread && timeout !== 0) {
-      this.currentThread.waitHandle = handle;
-      this.currentThread.resumeAt = timeout === 0xffffffff
-        ? Infinity
-        : this.clockNow() + (timeout >>> 0);
-      this.exports?.d2_request_yield?.();
+    if (this.currentThread) {
+      this.currentThread.wait = {
+        type: "handle",
+        handle: handle >>> 0,
+        started: this.clockNow(),
+        timeout: timeout >>> 0,
+      };
+      this.currentThread.resumeResult = null;
+      this.requestYield();
       return timeout === 0xffffffff ? 0 : 258;
     }
     const threads = target?.type === "thread"
       ? [target]
       : Array.from(this.handles.values()).filter((item) => item.type === "thread" && !item.finished);
+    // Browser imports cannot synchronously block the worker. Keep the main
+    // context's compatibility behavior: pump guest threads briefly, then let
+    // Diablo continue. Guest-created threads still use resumable timed waits.
     for (let round = 0; round < 32 && threads.length; round++) {
       for (const thread of threads) {
         this.runThread(thread);
-        if (consumeSignal() || target?.type === "thread" && target.finished) return 0;
+        if (this.backgroundCriticalOwner() === null && this.waitImmediate(handle)) return 0;
       }
     }
-    return timeout === 0 ? 258 : 0;
+    return 0;
   }
 
   kernel32() {
@@ -886,10 +1008,50 @@ export class Win32Runtime {
         const pointer = this.arg(sp, 0), value = (this.view().getInt32(pointer, true) - 1) | 0;
         this.view().setInt32(pointer, value, true); return value;
       },
-      InitializeCriticalSection: () => 0,
-      DeleteCriticalSection: () => 0,
-      EnterCriticalSection: () => 0,
-      LeaveCriticalSection: () => 0,
+      InitializeCriticalSection: (sp) => {
+        const pointer = this.arg(sp, 0);
+        this.criticalSections.set(pointer, { owner: 0, recursion: 0 });
+        new Uint8Array(this.memory.buffer, pointer, 24).fill(0);
+        this.view().setInt32(pointer + 4, -1, true);
+        return 0;
+      },
+      DeleteCriticalSection: (sp) => {
+        const pointer = this.arg(sp, 0), thread = this.currentThread?.handle ?? 1;
+        const section = this.criticalSections.get(pointer);
+        if (section && section.owner && section.owner !== thread) {
+          throw new Error(`critical section ${pointer.toString(16)} deleted by ${thread.toString(16)} while owned by ${section.owner.toString(16)}`);
+        }
+        this.criticalSections.delete(pointer);
+        new Uint8Array(this.memory.buffer, pointer, 24).fill(0);
+        return 0;
+      },
+      EnterCriticalSection: (sp) => {
+        const pointer = this.arg(sp, 0), thread = this.currentThread?.handle ?? 1;
+        const section = this.criticalSections.get(pointer) ?? { owner: 0, recursion: 0 };
+        if (section.owner && section.owner !== thread) {
+          throw new Error(`critical section contention at ${pointer.toString(16)}: ${thread.toString(16)} entered while owned by ${section.owner.toString(16)}`);
+        }
+        section.owner = thread;
+        section.recursion++;
+        this.criticalSections.set(pointer, section);
+        this.view().setInt32(pointer + 4, 0, true);
+        this.view().setUint32(pointer + 8, section.recursion, true);
+        this.view().setUint32(pointer + 12, section.owner, true);
+        return 0;
+      },
+      LeaveCriticalSection: (sp) => {
+        const pointer = this.arg(sp, 0), thread = this.currentThread?.handle ?? 1;
+        const section = this.criticalSections.get(pointer);
+        if (!section || section.owner !== thread || !section.recursion) {
+          throw new Error(`invalid critical section leave at ${pointer.toString(16)} by ${thread.toString(16)}`);
+        }
+        section.recursion--;
+        if (!section.recursion) section.owner = 0;
+        this.view().setInt32(pointer + 4, section.owner ? 0 : -1, true);
+        this.view().setUint32(pointer + 8, section.recursion, true);
+        this.view().setUint32(pointer + 12, section.owner, true);
+        return 0;
+      },
       TlsAlloc: () => this.nextTls++,
       TlsFree: (sp) => { this.tls.delete(this.arg(sp, 0)); return 1; },
       TlsSetValue: (sp) => { this.tls.set(this.arg(sp, 0), this.arg(sp, 1)); return 1; },
@@ -917,12 +1079,7 @@ export class Win32Runtime {
       },
       SetEvent: (sp) => {
         const handle = this.arg(sp, 0), event = this.handles.get(handle);
-        if (event) {
-          event.signaled = true;
-          for (const thread of this.handles.values()) {
-            if (thread.type === "thread" && thread.waitHandle === handle) thread.resumeAt = 0;
-          }
-        }
+        if (event) event.signaled = true;
         return event ? 1 : 0;
       },
       ResetEvent: (sp) => { const event = this.handles.get(this.arg(sp, 0)); if (event) event.signaled = false; return event ? 1 : 0; },
@@ -936,8 +1093,8 @@ export class Win32Runtime {
       IsBadWritePtr: () => 0,
       GetProcessHeap: () => 1,
       SetErrorMode: (sp) => { const previous = this.errorMode; this.errorMode = this.arg(sp, 0); return previous; },
-      QueryPerformanceFrequency: (sp) => { this.view().setBigUint64(this.arg(sp, 0), 1000000n, true); return 1; },
-      QueryPerformanceCounter: (sp) => { this.view().setBigUint64(this.arg(sp, 0), BigInt(this.clockNow()) * 1000n, true); return 1; },
+      QueryPerformanceFrequency: (sp) => { this.view().setBigUint64(this.arg(sp, 0), 1000000000n, true); return 1; },
+      QueryPerformanceCounter: (sp) => { this.view().setBigUint64(this.arg(sp, 0), this.performanceCounter(), true); return 1; },
       OutputDebugStringA: (sp) => {
         this.events.push({ type: "debug", text: this.readCString(this.arg(sp, 0)), trace: this.captureTrace(32) });
         if (this.events.length > 256) this.events.shift();
@@ -1005,6 +1162,7 @@ export class Win32Runtime {
         const thread = {
           type: "thread", handle, start: this.arg(sp, 2), parameter,
           stackBase, stackTop, context, exitCode: 259, status: 0, finished: false,
+          wait: null, resumeResult: null,
         };
         this.handles.set(handle, thread);
         const threadId = this.arg(sp, 5); if (threadId) this.view().setUint32(threadId, handle, true);

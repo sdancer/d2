@@ -349,7 +349,7 @@ startButton.addEventListener("click", async () => {
   });
   const surface = canvas.transferControlToOffscreen();
   const diagnostics = parameters.get("diagnostics") === "1";
-  const renderer = parameters.get("renderer") === "gdi" ? "gdi" : "glide";
+  const renderer = parameters.get("renderer") === "glide" ? "glide" : "gdi";
   worker.postMessage({
     type: "start",
     canvas: surface,
