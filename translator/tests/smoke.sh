@@ -172,6 +172,148 @@ if (output.result !== 42 || output.status !== 0) {
 console.log(`linked translated PEs returned ${output.result}, status ${output.status}`);
 JS
 
+PYTHONPATH="$root" python - "$build/smoke-workspace.sqlite" <<'PY'
+import sqlite3
+import sys
+from d2wasm.debugdb import SCHEMA
+
+connection = sqlite3.connect(sys.argv[1])
+connection.executescript(SCHEMA)
+connection.executemany(
+    "INSERT INTO metadata(key, value) VALUES (?, ?)",
+    [("schema_version", "1"), ("entry_va", "0")],
+)
+connection.commit()
+PY
+
+set +e
+"$root/d2wasm.py" link-translate "$build" \
+  --link-manifest "$build/smoke-linked.json" \
+  --output-dir "$build/lifted-linked-workspace" \
+  --debug-db "$build/smoke-workspace.sqlite" \
+  --debug-db-only \
+  --work-item-budget 1
+checkpoint_status=$?
+set -e
+if [[ "$checkpoint_status" -ne 3 ]]; then
+  echo "workspace checkpoint returned $checkpoint_status, expected 3" >&2
+  exit 1
+fi
+"$root/d2wasm.py" link-translate "$build" \
+  --link-manifest "$build/smoke-linked.json" \
+  --output-dir "$build/lifted-linked-workspace" \
+  --debug-db "$build/smoke-workspace.sqlite"
+cmp "$build/lifted-linked/linked.c" "$build/lifted-linked-workspace/linked.c"
+python - "$build/smoke-workspace.sqlite" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+require(connection.execute("PRAGMA user_version").fetchone()[0] == 2, "wrong user_version")
+require(
+    connection.execute(
+        "SELECT value FROM metadata WHERE key='schema_version'"
+    ).fetchone()[0] == "2",
+    "wrong metadata schema version",
+)
+require(
+    connection.execute(
+        "SELECT value FROM metadata WHERE key='migrated_from'"
+    ).fetchone()[0] == "1",
+    "schema-v1 migration did not run",
+)
+require(connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok", "integrity check failed")
+require(not connection.execute("PRAGMA foreign_key_check").fetchall(), "foreign-key check failed")
+require(
+    connection.execute(
+        "SELECT COUNT(*) FROM work_items WHERE state IN ('pending', 'leased')"
+    ).fetchone()[0] == 0,
+    "unfinished work remains",
+)
+require(
+    connection.execute(
+        "SELECT COUNT(*) FROM root_facts WHERE kind='pe_entry'"
+    ).fetchone()[0] >= 1,
+    "PE entry provenance is missing",
+)
+require(
+    connection.execute(
+        "SELECT COUNT(*) FROM root_facts WHERE kind='internal_binding'"
+    ).fetchone()[0] >= 1,
+    "internal-binding provenance is missing",
+)
+require(
+    connection.execute(
+        """SELECT COUNT(*) FROM graph_accounting
+           WHERE mapped_executable_bytes != classified_executable_bytes"""
+    ).fetchone()[0] == 0,
+    "byte accounting is not exhaustive",
+)
+require(
+    connection.execute(
+        "SELECT COUNT(*) FROM revision_edges WHERE resolution IS NULL OR resolution=''"
+    ).fetchone()[0] == 0,
+    "edge resolution is missing",
+)
+require(
+    connection.execute(
+        "SELECT COUNT(*) FROM revision_edges WHERE resolution='internal_import'"
+    ).fetchone()[0] >= 1,
+    "internal import edge was not resolved",
+)
+require(
+    connection.execute(
+        "SELECT COUNT(*) FROM xrefs WHERE kind IN ('import_call', 'import_jump')"
+    ).fetchone()[0] >= 1,
+    "internal import control-flow xref is missing",
+)
+require(
+    connection.execute(
+        "SELECT COUNT(*) FROM xrefs WHERE kind='data'"
+    ).fetchone()[0] >= 1,
+    "absolute data xref is missing",
+)
+print("workspace migration, resume, provenance, graph, and byte accounting passed")
+PY
+workspace_output="$(node "$root/runtime/run-linked.mjs" \
+  "$build/lifted-linked-workspace/linked.wasm" \
+  "$build/lifted-linked-workspace/linked-translation.json" \
+  "$build/smoke-linked.json" \
+  "$build")"
+node - "$workspace_output" <<'JS'
+const output = JSON.parse(process.argv[2]);
+if (output.result !== 42 || output.status !== 0) {
+  throw new Error(`workspace linked PEs returned ${output.result}, status ${output.status}`);
+}
+console.log(`workspace linked PEs returned ${output.result}, status ${output.status}`);
+JS
+revisions_before="$(python - "$build/smoke-workspace.sqlite" <<'PY'
+import sqlite3
+import sys
+print(sqlite3.connect(sys.argv[1]).execute("SELECT COUNT(*) FROM block_revisions").fetchone()[0])
+PY
+)"
+"$root/d2wasm.py" link-translate "$build" \
+  --link-manifest "$build/smoke-linked.json" \
+  --output-dir "$build/lifted-linked-workspace" \
+  --debug-db "$build/smoke-workspace.sqlite" \
+  --debug-db-only
+revisions_after="$(python - "$build/smoke-workspace.sqlite" <<'PY'
+import sqlite3
+import sys
+print(sqlite3.connect(sys.argv[1]).execute("SELECT COUNT(*) FROM block_revisions").fetchone()[0])
+PY
+)"
+if [[ "$revisions_before" != "$revisions_after" ]]; then
+  echo "completed workspace created duplicate revisions" >&2
+  exit 1
+fi
+
 "$root/d2wasm.py" link "$root/../extracted" \
   --filename-map "$root/filename-map.json" \
   --entry-module "Diablo II.exe" \

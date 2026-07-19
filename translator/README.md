@@ -222,10 +222,16 @@ Recording also creates `barbarian.jsonl.state`, a snapshot of the initial
 so it neither depends on nor modifies the live character saves. Live gameplay
 input is ignored during replay except for closing the window.
 
-## SQLite lifted-code debug database
+## Persistent SQLite translation workspace
 
-`link-translate` can materialize the complete discovered program graph without
-regenerating or compiling the large Wasm artifact:
+`link-translate --debug-db` uses SQLite as a durable analysis workspace rather
+than deleting and rebuilding a sidecar. The workspace enables foreign-key
+checks and WAL journaling, commits immutable block revisions individually, and
+retains pending, leased, completed, blocked, unsupported, ambiguous, and failed
+work across process restarts. Opening an old schema-v1 debug database migrates
+it in place while preserving the compatibility tables and views.
+
+Materialize or resume the discovered program graph without compiling Wasm:
 
 ```sh
 ./d2wasm.py link-translate ../extracted \
@@ -238,10 +244,28 @@ regenerating or compiling the large Wasm artifact:
   --debug-db-only
 ```
 
-The SQLite sidecar contains modules, sections, roots, blocks, every lifted
-instruction, CFG/call edges, resolved code and data xrefs, imports, exports,
-and extracted ASCII/UTF-16 strings. Indexed `call_xrefs` and `string_xrefs`
-views make common debugging queries short. For example:
+For bounded batch work, `--work-item-budget N` commits at most `N` discovery
+attempts and exits with status 3 while unfinished work remains. Run the same
+command again without the budget to resume the same analysis. Terminal failures
+are durable; use `--retry-failed-work` to retry them explicitly.
+
+The original `modules`, `sections`, `roots`, `blocks`, `instructions`, `edges`,
+`xrefs`, imports, exports, strings, `call_xrefs`, and `string_xrefs` remain the
+current selected-graph projection. Schema-v2 tables additionally retain:
+
+- binary, module, tool, and analysis-run identities;
+- every root source separately (entry, export, internal binding, configured,
+  and relocation-proven roots);
+- immutable block revisions, exact attempt history, and resumable leases;
+- rejected direct targets and unresolved indirect transfers;
+- non-overlapping classifications for every mapped executable byte;
+- per-module graph and byte-accounting summaries.
+
+Probable code found by the linear gap sweep is accounting evidence only; it is
+not silently promoted into generated code. Ambiguous bytes and indirect targets
+remain explicit and measurable.
+
+Existing debugging queries continue to work:
 
 ```sql
 SELECT source_module, printf('0x%08x', source_va),
@@ -255,8 +279,32 @@ FROM edges
 WHERE target_block_va = 0x010651a0;
 ```
 
-On the verified full build the database contains 16 modules, 223,392 blocks,
-912,528 instruction rows, 355,518 CFG edges, and 237,106 xrefs.
+Workspace health and progress can be checked directly:
+
+```sql
+PRAGMA user_version;
+PRAGMA integrity_check;
+PRAGMA foreign_key_check;
+
+-- Bind :run_id to the analysis_run_id printed by link-translate.
+SELECT state, COUNT(*) FROM work_items
+WHERE run_id = :run_id GROUP BY state;
+SELECT kind, resolution, COUNT(*) FROM root_facts
+WHERE run_id = :run_id GROUP BY kind, resolution;
+SELECT edge.resolution, COUNT(*)
+FROM run_block_selections AS selected
+JOIN revision_edges AS edge ON edge.revision_id = selected.revision_id
+WHERE selected.run_id = :run_id GROUP BY edge.resolution;
+SELECT runtime_name, mapped_executable_bytes, classified_executable_bytes,
+       unresolved_bytes, pending_work
+FROM graph_accounting
+JOIN module_versions USING (module_version_id)
+WHERE run_id = :run_id;
+```
+
+The compatibility projection for the previously verified full build contained
+16 modules, 223,392 blocks, 912,528 instruction rows, 355,518 CFG edges, and
+237,106 xrefs.
 
 ## Other commands
 
@@ -283,9 +331,10 @@ node runtime/run-translated.mjs \
   ../extracted/File00000137.exe
 ```
 
-Use `--relocation-roots` for a conservative callback/vtable pass. It seeds
-every executable address stored in a PE base-relocation slot, rather than
-guessing pointers from arbitrary data. Repeatable `--root RVA` values are
+Use `--relocation-roots` for a conservative callback/vtable pass. It records
+HIGHLOW relocation evidence and seeds executable targets unless the target
+itself looks like a pointer table; those candidates remain explicit ambiguous
+root facts instead of being decoded as code. Repeatable `--root RVA` values are
 useful for tight runtime-guided iterations.
 
 `inventory.json` is intended to drive the long-running port: it records hashes,

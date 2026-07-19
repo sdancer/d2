@@ -10,8 +10,10 @@ from typing import Any, Iterable
 from capstone import CS_GRP_CALL, CS_GRP_JUMP
 from capstone.x86 import X86_OP_IMM, X86_OP_MEM
 
+from .analysis import classify_executable_bytes, summarize_graph_accounting
 from .cfg import Block
 from .pe import PEImage
+from .workspace import TranslationStore
 
 
 SCHEMA_VERSION = 1
@@ -194,26 +196,28 @@ def _edge_kinds(block: Block) -> list[str]:
     return [block.terminator] * count
 
 
-def _extract_strings(unit: DebugUnit) -> Iterable[tuple[int, int, str, str]]:
-    for section in unit.image.binary.sections:
-        if section in unit.image.executable_sections():
+def extract_strings(image: PEImage) -> Iterable[tuple[int, str, str]]:
+    for section in image.binary.sections:
+        if section in image.executable_sections():
             continue
         content = bytes(section.content)
         section_rva = int(section.virtual_address)
         for match in re.finditer(rb"[\x20-\x7e]{4,}", content):
-            rva = section_rva + match.start()
-            yield unit.load_base + rva, rva, "ascii", match.group().decode("ascii")
+            yield section_rva + match.start(), "ascii", match.group().decode("ascii")
         for match in re.finditer(rb"(?:[\x20-\x7e]\x00){4,}", content):
-            rva = section_rva + match.start()
             yield (
-                unit.load_base + rva,
-                rva,
+                section_rva + match.start(),
                 "utf16le",
                 match.group().decode("utf-16le"),
             )
 
 
-def write_debug_database(
+def _extract_strings(unit: DebugUnit) -> Iterable[tuple[int, int, str, str]]:
+    for rva, encoding, value in extract_strings(unit.image):
+        yield unit.load_base + rva, rva, encoding, value
+
+
+def _write_debug_database_v1(
     path: Path,
     manifest: dict[str, Any],
     units: list[DebugUnit],
@@ -510,3 +514,249 @@ def write_debug_database(
         connection.execute("PRAGMA optimize")
     finally:
         connection.close()
+
+
+def write_debug_database(
+    path: Path,
+    manifest: dict[str, Any],
+    units: list[DebugUnit],
+) -> None:
+    """Persist a supplied graph through the durable schema-v2 workspace API."""
+
+    with TranslationStore(path) as store:
+        project_id = store.register_project(manifest, name=path.stem)
+        module_versions: dict[str, str] = {}
+        for unit in units:
+            inventory = unit.image.inventory(unit.runtime_name)
+            module_versions[unit.runtime_name.lower()] = store.register_module(
+                project_id,
+                {
+                    **inventory,
+                    "runtime_name": unit.runtime_name,
+                    "source": unit.source,
+                    "load_base": unit.load_base,
+                },
+                binary_data=unit.image.data,
+                inventory=inventory,
+            )
+        for unit in units:
+            store.register_static_inventory(
+                module_versions[unit.runtime_name.lower()],
+                unit.image.inventory(unit.runtime_name),
+                internal_bindings=manifest.get("internal_bindings", []),
+                strings=extract_strings(unit.image),
+            )
+
+        tool_version_id = store.register_tool_version(
+            "debugdb-compatibility-writer", "2", options={"source": "DebugUnit"}
+        )
+        roots_input = {
+            unit.runtime_name: list(unit.roots) for unit in units
+        }
+        run_id = store.register_analysis_run(
+            project_id,
+            tool_version_id,
+            {"mode": "compatibility_import"},
+            {"roots": roots_input},
+            status="running",
+        )
+        for unit in units:
+            module_version_id = module_versions[unit.runtime_name.lower()]
+            for root in unit.roots:
+                accepted = unit.image.is_executable_rva(root)
+                store.register_root_fact(
+                    run_id,
+                    module_version_id,
+                    root,
+                    "compatibility_root",
+                    confidence=1.0,
+                    accepted=accepted,
+                    resolution=(
+                        "resolved_executable"
+                        if accepted
+                        else (
+                            "non_executable"
+                            if unit.image.section_for_rva(root) is not None
+                            else "unmapped"
+                        )
+                    ),
+                )
+
+        linked_ranges = [
+            (
+                unit.load_base,
+                unit.load_base + unit.image.size_of_image,
+                module_versions[unit.runtime_name.lower()],
+            )
+            for unit in units
+        ]
+        internal_bindings: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for binding in manifest.get("internal_bindings", []):
+            symbol = binding["name"] or f"#{binding['ordinal']}"
+            internal_bindings[
+                (
+                    binding["importer"].lower(),
+                    binding["library"].lower(),
+                    symbol,
+                )
+            ] = binding
+
+        for unit in units:
+            module_version_id = module_versions[unit.runtime_name.lower()]
+            unit_preferred_ranges = [
+                (
+                    unit.image.image_base,
+                    unit.image.image_base + unit.image.size_of_image,
+                    unit.load_base,
+                    module_version_id,
+                )
+            ]
+            for block in unit.blocks.values():
+                edges = []
+                xrefs = []
+                source_rva = (
+                    int(block.instructions[-1].address) - unit.image.image_base
+                    if block.instructions
+                    else block.rva
+                )
+                for target_rva, kind in zip(block.successors, _edge_kinds(block)):
+                    edges.append(
+                        {
+                            "source_instruction_rva": source_rva,
+                            "target_module_version_id": module_version_id,
+                            "target_rva": target_rva,
+                            "kind": kind,
+                            "evidence_kind": "compatibility_graph",
+                            "resolution": (
+                                "resolved_executable"
+                                if target_rva in unit.blocks
+                                else "pending"
+                            ),
+                        }
+                    )
+                    if kind in ("call", "branch", "jump", "jump_table"):
+                        xrefs.append(
+                            {
+                                "source_rva": source_rva,
+                                "target_module_version_id": module_version_id,
+                                "target_rva": target_rva,
+                                "target_va": unit.load_base + target_rva,
+                                "kind": kind,
+                            }
+                        )
+                for instruction in block.instructions:
+                    instruction_rva = int(instruction.address) - unit.image.image_base
+                    is_control = instruction.group(CS_GRP_CALL) or instruction.group(
+                        CS_GRP_JUMP
+                    )
+                    for operand_index, operand in enumerate(instruction.operands):
+                        target = None
+                        if operand.type == X86_OP_IMM and not is_control:
+                            target = _linked_target(unit_preferred_ranges, int(operand.imm))
+                        elif (
+                            operand.type == X86_OP_MEM
+                            and int(operand.mem.base) == 0
+                            and int(operand.mem.index) == 0
+                        ):
+                            target = _linked_target(
+                                unit_preferred_ranges, int(operand.mem.disp)
+                            )
+                        if target is None:
+                            continue
+                        target_range = _module_for_va(linked_ranges, target)
+                        if target_range is not None:
+                            xrefs.append(
+                                {
+                                    "source_rva": instruction_rva,
+                                    "target_module_version_id": target_range[2],
+                                    "target_rva": target - target_range[0],
+                                    "target_va": target,
+                                    "kind": "data",
+                                    "operand_index": operand_index,
+                                }
+                            )
+                imported = block.imported_call
+                if imported is not None and block.instructions:
+                    symbol = imported.name or f"#{imported.ordinal}"
+                    binding = internal_bindings.get(
+                        (unit.runtime_name.lower(), imported.library.lower(), symbol)
+                    )
+                    if binding is not None:
+                        target_va = int(binding["target_va"])
+                        target_module_version_id = module_versions.get(
+                            binding["target_module"].lower()
+                        )
+                        target_rva = int(binding["target_rva"])
+                    else:
+                        target_va = unit.load_base + imported.iat_rva
+                        target_module_version_id = module_version_id
+                        target_rva = imported.iat_rva
+                    xrefs.append(
+                        {
+                            "source_rva": source_rva,
+                            "target_module_version_id": target_module_version_id,
+                            "target_rva": target_rva,
+                            "target_va": target_va,
+                            "kind": "import_call",
+                        }
+                    )
+                store.persist_block_revision(
+                    run_id,
+                    module_version_id,
+                    block.rva,
+                    instructions=block.instructions,
+                    edges=edges,
+                    xrefs=xrefs,
+                    terminator=block.terminator,
+                    unsupported_reason=block.unsupported_reason,
+                    imported_call=block.imported_call,
+                    facts={"source": "DebugUnit"},
+                    refresh_projection=False,
+                )
+
+            classifications, byte_metrics = classify_executable_bytes(
+                unit.image,
+                unit.blocks,
+            )
+            store.save_byte_classifications(
+                run_id,
+                module_version_id,
+                [item.to_dict() for item in classifications],
+                mapped_executable_bytes=byte_metrics["mapped_executable_bytes"],
+            )
+            stored_edges = [
+                dict(row)
+                for row in store.connection.execute(
+                    """SELECT edge.* FROM run_block_selections AS selection
+                       JOIN block_keys AS block
+                         ON block.block_key_id=selection.block_key_id
+                       JOIN revision_edges AS edge
+                         ON edge.revision_id=selection.revision_id
+                       WHERE selection.run_id=? AND block.module_version_id=?""",
+                    (run_id, module_version_id),
+                )
+            ]
+            metrics = summarize_graph_accounting(
+                byte_metrics,
+                unit.blocks,
+                stored_edges,
+                {"unfinished": 0, "blocked": 0},
+            )
+            store.save_graph_accounting(run_id, module_version_id, metrics)
+
+        store.refresh_compatibility_projection(run_id)
+        store.set_run_status(run_id, "completed")
+        summary = {
+            "modules": len(units),
+            "blocks": sum(len(unit.blocks) for unit in units),
+            "instructions": sum(
+                len(block.instructions)
+                for unit in units
+                for block in unit.blocks.values()
+            ),
+        }
+        with store.transaction(immediate=True):
+            store.connection.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES ('summary', ?)",
+                (json.dumps(summary, sort_keys=True),),
+            )

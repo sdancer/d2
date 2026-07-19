@@ -857,6 +857,7 @@ class CGenerator:
             if instruction.operands:
                 adjustment = int(instruction.operands[0].imm) & 0xFFFF
             lines += [
+                "  d2_emit_trace(D2_TRACE_RETURN, pc, load32(esp), esp);",
                 "  d2_next_pc = load32(esp);",
                 f"  esp += {4 + adjustment}u;",
                 "  if (d2_next_pc == D2_RETURN_SENTINEL) { d2_status = D2_STATUS_OK; return D2_ACTION_RETURN; }",
@@ -864,7 +865,7 @@ class CGenerator:
             ]
         elif block.terminator == "call":
             target, fallthrough = block.successors
-            lines += ["  esp -= 4u;", f"  store32(esp, 0x{self._pc(fallthrough):08x}u);", f"  d2_next_pc = 0x{self._pc(target):08x}u;", "  D2_CHAIN();"]
+            lines += [f"  d2_emit_trace(D2_TRACE_CALL, pc, 0x{self._pc(target):08x}u, esp);", "  esp -= 4u;", f"  store32(esp, 0x{self._pc(fallthrough):08x}u);", f"  d2_next_pc = 0x{self._pc(target):08x}u;", "  D2_CHAIN();"]
         elif block.terminator == "jump":
             lines += [f"  d2_next_pc = 0x{self._pc(block.successors[0]):08x}u;", "  D2_CHAIN();"]
         elif block.terminator == "fallthrough" and block.successors:
@@ -875,7 +876,7 @@ class CGenerator:
             if address is None:
                 lines += ["  d2_status = D2_STATUS_UNSUPPORTED;", "  return D2_ACTION_RETURN;"]
             else:
-                lines += [f"  d2_next_pc = {self._dynamic_pc(f'load32({address})')};", "  D2_CHAIN();"]
+                lines += [f"  d2_next_pc = {self._dynamic_pc(f'load32({address})')};", "  d2_emit_trace(D2_TRACE_INDIRECT, pc, d2_next_pc, esp);", "  D2_CHAIN();"]
         elif block.terminator == "conditional":
             condition = self._condition(block.instructions[-1])
             if condition is None:
@@ -889,6 +890,7 @@ class CGenerator:
             spec = self.api_specs.get(key)
             internal_target = self.internal_targets.get(key)
             intrinsic = self._intrinsic_import(key)
+            lines.append(f"  d2_emit_trace(D2_TRACE_IMPORT, pc, 0x{(internal_target or 0):08x}u, esp);")
             if key.lower() == "dsound.dll!#2":
                 lines += [
                     "  a = load32(esp);",
@@ -934,6 +936,7 @@ class CGenerator:
             spec = self.api_specs.get(key)
             internal_target = self.internal_targets.get(key)
             intrinsic = self._intrinsic_import(key)
+            lines.append(f"  d2_emit_trace(D2_TRACE_IMPORT, pc, 0x{(internal_target or 0):08x}u, esp);")
             if key.lower() == "dsound.dll!#2":
                 lines += [
                     "  a = load32(esp + 4u);",
@@ -982,6 +985,7 @@ class CGenerator:
                 lines += ["  d2_status = D2_STATUS_UNSUPPORTED;", "  return D2_ACTION_RETURN;"]
             else:
                 lines.append(f"  a = {target[0]};")
+                lines.append("  d2_emit_trace(D2_TRACE_INDIRECT, pc, a, esp);")
                 if block.terminator == "indirect_call":
                     lines += ["  esp -= 4u;", f"  store32(esp, 0x{self._pc(block.successors[0]):08x}u);"]
                 lines += [f"  d2_next_pc = {self._dynamic_pc('a')};", "  D2_CHAIN();"]
@@ -1113,8 +1117,24 @@ static uint64_t d2_tsc;
 static const char d2_dsound_description[] = "D2Wasm DirectSound";
 static const char d2_dsound_module[] = "dsound.dll";
 enum { D2_TRACE_CAPACITY = 16384u, D2_TRACE_MASK = D2_TRACE_CAPACITY - 1u };
+enum {
+  D2_TRACE_BLOCK = 1, D2_TRACE_EDGE = 2, D2_TRACE_CALL = 3,
+  D2_TRACE_RETURN = 4, D2_TRACE_INDIRECT = 5, D2_TRACE_IMPORT = 6,
+  D2_TRACE_REPLACEMENT = 7, D2_TRACE_MEMORY_READ = 8, D2_TRACE_MEMORY_WRITE = 9
+};
 static uint32_t d2_trace_pc[D2_TRACE_CAPACITY], d2_trace_esp[D2_TRACE_CAPACITY], d2_trace_index;
+static uint32_t d2_event_kind[D2_TRACE_CAPACITY], d2_event_source[D2_TRACE_CAPACITY];
+static uint32_t d2_event_target[D2_TRACE_CAPACITY], d2_event_aux[D2_TRACE_CAPACITY], d2_event_index;
+static uint32_t d2_trace_enabled, d2_trace_memory_enabled;
 static uint32_t d2_diagnostics_enabled;
+
+static inline void d2_emit_trace(uint32_t kind, uint32_t source, uint32_t target, uint32_t aux) {
+  if (!d2_trace_enabled) return;
+  uint32_t index = d2_event_index & D2_TRACE_MASK;
+  d2_event_kind[index] = kind; d2_event_source[index] = source;
+  d2_event_target[index] = target; d2_event_aux[index] = aux;
+  d2_event_index++;
+}
 static uint32_t d2_watch_pc, d2_watch_hit, d2_watch_registers[8], d2_stop_on_watch, d2_watch_skip;
 static uint32_t d2_count_pc, d2_count_hits;
 static uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp, fs_base;
@@ -1124,6 +1144,12 @@ static uint32_t fpu_depth;
 static uint16_t fpu_status;
 static uint16_t fpu_control;
 static volatile uint32_t d2_yield_requested;
+enum { D2_OVERRIDE_CAPACITY = 256u };
+static uint32_t d2_override_entry[D2_OVERRIDE_CAPACITY];
+static uint32_t d2_override_kind[D2_OVERRIDE_CAPACITY];
+static uint32_t d2_override_value[D2_OVERRIDE_CAPACITY];
+static uint32_t d2_override_cleanup[D2_OVERRIDE_CAPACITY];
+static uint32_t d2_override_count;
 
 typedef struct {
   uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp, fs_base;
@@ -1162,14 +1188,14 @@ static inline void d2_restore_cpu(const D2CpuState *state) {
   fpu_control = state->fpu_control;
 }
 
-static inline uint8_t load8(uint32_t p) { return *(uint8_t *)(uintptr_t)p; }
-static inline uint16_t load16(uint32_t p) { return *(uint16_t *)(uintptr_t)p; }
-static inline uint32_t load32(uint32_t p) { return *(uint32_t *)(uintptr_t)p; }
-static inline uint64_t load64(uint32_t p) { return *(uint64_t *)(uintptr_t)p; }
-static inline void store8(uint32_t p, uint8_t v) { *(uint8_t *)(uintptr_t)p = v; }
-static inline void store16(uint32_t p, uint16_t v) { *(uint16_t *)(uintptr_t)p = v; }
-static inline void store32(uint32_t p, uint32_t v) { *(uint32_t *)(uintptr_t)p = v; }
-static inline void store64(uint32_t p, uint64_t v) { *(uint64_t *)(uintptr_t)p = v; }
+static inline uint8_t load8(uint32_t p) { uint8_t v = *(uint8_t *)(uintptr_t)p; if (d2_trace_memory_enabled) d2_emit_trace(D2_TRACE_MEMORY_READ, d2_last_pc, p, v); return v; }
+static inline uint16_t load16(uint32_t p) { uint16_t v = *(uint16_t *)(uintptr_t)p; if (d2_trace_memory_enabled) d2_emit_trace(D2_TRACE_MEMORY_READ, d2_last_pc, p, v); return v; }
+static inline uint32_t load32(uint32_t p) { uint32_t v = *(uint32_t *)(uintptr_t)p; if (d2_trace_memory_enabled) d2_emit_trace(D2_TRACE_MEMORY_READ, d2_last_pc, p, v); return v; }
+static inline uint64_t load64(uint32_t p) { uint64_t v = *(uint64_t *)(uintptr_t)p; if (d2_trace_memory_enabled) d2_emit_trace(D2_TRACE_MEMORY_READ, d2_last_pc, p, (uint32_t)v); return v; }
+static inline void store8(uint32_t p, uint8_t v) { *(uint8_t *)(uintptr_t)p = v; if (d2_trace_memory_enabled) d2_emit_trace(D2_TRACE_MEMORY_WRITE, d2_last_pc, p, v); }
+static inline void store16(uint32_t p, uint16_t v) { *(uint16_t *)(uintptr_t)p = v; if (d2_trace_memory_enabled) d2_emit_trace(D2_TRACE_MEMORY_WRITE, d2_last_pc, p, v); }
+static inline void store32(uint32_t p, uint32_t v) { *(uint32_t *)(uintptr_t)p = v; if (d2_trace_memory_enabled) d2_emit_trace(D2_TRACE_MEMORY_WRITE, d2_last_pc, p, v); }
+static inline void store64(uint32_t p, uint64_t v) { *(uint64_t *)(uintptr_t)p = v; if (d2_trace_memory_enabled) d2_emit_trace(D2_TRACE_MEMORY_WRITE, d2_last_pc, p, (uint32_t)v); }
 static inline float load_f32(uint32_t p) { return *(float *)(uintptr_t)p; }
 static inline double load_f64(uint32_t p) { return *(double *)(uintptr_t)p; }
 static inline void store_f32(uint32_t p, float v) { *(float *)(uintptr_t)p = v; }
@@ -1322,6 +1348,8 @@ static inline uint32_t rotate_value(uint32_t value, uint32_t count, uint32_t bit
   if (!*(fuel_pointer)) return D2_ACTION_CONTINUE; \
   (*(fuel_pointer))--; \
   uint32_t d2_current_pc = (pc_value); \
+  if (d2_last_pc) d2_emit_trace(D2_TRACE_EDGE, d2_last_pc, d2_current_pc, esp); \
+  d2_emit_trace(D2_TRACE_BLOCK, d2_current_pc, d2_current_pc, esp); \
   d2_previous_pc = d2_last_pc; \
   d2_last_pc = d2_current_pc; \
   if (__builtin_expect(d2_diagnostics_enabled, 0)) { \
@@ -1348,9 +1376,46 @@ static inline uint32_t rotate_value(uint32_t value, uint32_t count, uint32_t bit
 
 @SHARDS@
 
+static uint32_t d2_apply_override(uint32_t pc, uint32_t *block_fuel, uint32_t *action) {
+  uint32_t a, b, result;
+  for (uint32_t index = 0; index < d2_override_count; index++) {
+    if (d2_override_entry[index] != pc || !d2_override_kind[index]) continue;
+    D2_BEGIN_BLOCK(pc, block_fuel);
+    d2_emit_trace(D2_TRACE_REPLACEMENT, pc, d2_override_value[index], d2_override_kind[index]);
+    if (d2_override_kind[index] == 2u) {
+      d2_next_pc = d2_override_value[index];
+      *action = D2_ACTION_CONTINUE;
+      return 1u;
+    }
+    if (d2_override_kind[index] == 3u) {
+      a = load32(esp + 4u); b = load32(esp + 8u); result = a + b;
+      flags_add32(a, b, result, 32u); eax = result;
+    } else {
+      eax = d2_override_value[index];
+    }
+    d2_next_pc = load32(esp);
+    d2_emit_trace(D2_TRACE_RETURN, pc, d2_next_pc, esp);
+    esp += 4u + d2_override_cleanup[index];
+    if (d2_next_pc == D2_RETURN_SENTINEL) {
+      d2_status = D2_STATUS_OK;
+      *action = D2_ACTION_RETURN;
+    } else {
+      *action = D2_ACTION_CONTINUE;
+    }
+    return 1u;
+  }
+  return 0u;
+}
+
 __attribute__((noinline))
 static uint32_t d2_dispatch_block(uint32_t pc, uint32_t *block_fuel) {
   for (;;) {
+    uint32_t override_action;
+    if (d2_apply_override(pc, block_fuel, &override_action)) {
+      if (override_action == D2_ACTION_RETURN || !*block_fuel) return override_action;
+      pc = d2_next_pc;
+      continue;
+    }
     if (pc >= 0x@HOST_THUNK_BASE@u) {
       D2_BEGIN_BLOCK(pc, block_fuel);
 @HOST_THUNK_DISPATCH@
@@ -1379,6 +1444,7 @@ static void d2_initialize_cpu(uint32_t entry_rva, uint32_t initial_esp) {
   d2_status = D2_STATUS_OK;
   d2_next_pc = entry_rva;
   d2_trace_index = 0;
+  d2_event_index = 0;
   d2_watch_hit = 0;
   d2_yield_requested = 0;
 }
@@ -1563,6 +1629,84 @@ uint32_t d2_get_watch_hit(void) { return d2_watch_hit; }
 
 __attribute__((export_name("d2_watch_register")))
 uint32_t d2_get_watch_register(uint32_t index) { return index < 8u ? d2_watch_registers[index] : 0u; }
+
+__attribute__((export_name("d2_set_trace")))
+void d2_set_trace(uint32_t enabled, uint32_t memory_enabled) {
+  d2_trace_enabled = enabled != 0; d2_trace_memory_enabled = memory_enabled != 0;
+  d2_event_index = 0;
+}
+__attribute__((export_name("d2_event_count")))
+uint32_t d2_event_count(void) { return d2_event_index < D2_TRACE_CAPACITY ? d2_event_index : D2_TRACE_CAPACITY; }
+__attribute__((export_name("d2_event_kind")))
+uint32_t d2_get_event_kind(uint32_t back) { return d2_event_kind[(d2_event_index - 1u - back) & D2_TRACE_MASK]; }
+__attribute__((export_name("d2_event_source")))
+uint32_t d2_get_event_source(uint32_t back) { return d2_event_source[(d2_event_index - 1u - back) & D2_TRACE_MASK]; }
+__attribute__((export_name("d2_event_target")))
+uint32_t d2_get_event_target(uint32_t back) { return d2_event_target[(d2_event_index - 1u - back) & D2_TRACE_MASK]; }
+__attribute__((export_name("d2_event_aux")))
+uint32_t d2_get_event_aux(uint32_t back) { return d2_event_aux[(d2_event_index - 1u - back) & D2_TRACE_MASK]; }
+
+__attribute__((export_name("d2_state_size")))
+uint32_t d2_state_size(void) { return (uint32_t)sizeof(D2CpuState); }
+__attribute__((export_name("d2_capture_state")))
+void d2_capture_state(uint32_t pointer) { d2_capture_cpu((D2CpuState *)(uintptr_t)pointer); }
+__attribute__((export_name("d2_restore_state")))
+void d2_restore_state(uint32_t pointer) { d2_restore_cpu((D2CpuState *)(uintptr_t)pointer); }
+__attribute__((export_name("d2_get_register")))
+uint32_t d2_get_register(uint32_t index) {
+  uint32_t values[15] = { eax, ebx, ecx, edx, esi, edi, ebp, esp, fs_base, zf, sf, cf, of, pf, df };
+  return index < 15u ? values[index] : 0u;
+}
+__attribute__((export_name("d2_set_register")))
+void d2_set_register(uint32_t index, uint32_t value) {
+  switch (index) {
+    case 0: eax=value; break; case 1: ebx=value; break; case 2: ecx=value; break;
+    case 3: edx=value; break; case 4: esi=value; break; case 5: edi=value; break;
+    case 6: ebp=value; break; case 7: esp=value; break; case 8: fs_base=value; break;
+    case 9: zf=value!=0; break; case 10: sf=value!=0; break; case 11: cf=value!=0; break;
+    case 12: of=value!=0; break; case 13: pf=value!=0; break; case 14: df=value!=0; break;
+  }
+}
+
+__attribute__((export_name("d2_invoke_state")))
+uint32_t d2_invoke_state(uint32_t entry, uint32_t state_pointer, uint32_t stack_pointer,
+                         uint32_t arguments, uint32_t argument_count, uint32_t block_fuel) {
+  D2CpuState outer_cpu;
+  d2_capture_cpu(&outer_cpu);
+  uint32_t outer_status=d2_status, outer_last=d2_last_pc, outer_previous=d2_previous_pc;
+  uint32_t outer_next=d2_next_pc, outer_yield=d2_yield_requested;
+  d2_restore_cpu((D2CpuState *)(uintptr_t)state_pointer);
+  if (stack_pointer) esp = stack_pointer;
+  while (argument_count) { argument_count--; esp -= 4u; store32(esp, load32(arguments + argument_count * 4u)); }
+  esp -= 4u; store32(esp, D2_RETURN_SENTINEL);
+  d2_status=D2_STATUS_OK; d2_next_pc=entry; d2_yield_requested=0;
+  uint32_t result=d2_execute(block_fuel);
+  d2_invoke_status=d2_status;
+  d2_capture_cpu((D2CpuState *)(uintptr_t)state_pointer);
+  d2_restore_cpu(&outer_cpu);
+  d2_status=outer_status; d2_last_pc=outer_last; d2_previous_pc=outer_previous;
+  d2_next_pc=outer_next; d2_yield_requested=outer_yield;
+  return result;
+}
+
+__attribute__((export_name("d2_clear_overrides")))
+void d2_clear_overrides(void) { d2_override_count = 0; }
+__attribute__((export_name("d2_set_override")))
+uint32_t d2_set_override(uint32_t entry, uint32_t kind, uint32_t value, uint32_t stack_cleanup) {
+  for (uint32_t index=0; index<d2_override_count; index++) {
+    if (d2_override_entry[index] == entry) {
+      d2_override_kind[index]=kind; d2_override_value[index]=value;
+      d2_override_cleanup[index]=stack_cleanup; return 1u;
+    }
+  }
+  if (d2_override_count >= D2_OVERRIDE_CAPACITY) return 0u;
+  uint32_t index=d2_override_count++;
+  d2_override_entry[index]=entry; d2_override_kind[index]=kind;
+  d2_override_value[index]=value; d2_override_cleanup[index]=stack_cleanup;
+  return 1u;
+}
+__attribute__((export_name("d2_override_count")))
+uint32_t d2_get_override_count(void) { return d2_override_count; }
 '''
 
 

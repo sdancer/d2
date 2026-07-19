@@ -73,6 +73,99 @@ export class Win32Runtime {
     }));
   }
 
+  captureTypedTrace(limit = 16_384) {
+    if (!this.exports?.d2_event_count) return [];
+    const names = {
+      1: "block", 2: "edge", 3: "call", 4: "return", 5: "indirect_target",
+      6: "api", 7: "replacement", 8: "memory_read", 9: "memory_write",
+    };
+    const count = Math.min(this.exports.d2_event_count() >>> 0, limit);
+    return Array.from({ length: count }, (_, reverseIndex) => {
+      const back = count - 1 - reverseIndex;
+      const kindId = this.exports.d2_event_kind(back) >>> 0;
+      return {
+        sequence: reverseIndex,
+        kind: names[kindId] ?? `unknown_${kindId}`,
+        source: this.exports.d2_event_source(back) >>> 0,
+        target: this.exports.d2_event_target(back) >>> 0,
+        aux: this.exports.d2_event_aux(back) >>> 0,
+      };
+    });
+  }
+
+  snapshot(ranges = [], statePointer = null) {
+    const stateSize = this.exports?.d2_state_size?.() >>> 0;
+    const pointer = statePointer ?? this.alloc(stateSize || 128, 8);
+    this.exports?.d2_capture_state?.(pointer);
+    const bytes = new Uint8Array(this.memory.buffer);
+    return {
+      statePointer: pointer,
+      cpu: Buffer.from(bytes.slice(pointer, pointer + stateSize)).toString("base64"),
+      memory: ranges.map(({ start, size }) => ({
+        start: start >>> 0,
+        size: size >>> 0,
+        data: Buffer.from(bytes.slice(start >>> 0, (start + size) >>> 0)).toString("base64"),
+      })),
+      runtime: {
+        virtualTime: this.virtualTime >>> 0,
+        cursorX: this.cursorX | 0,
+        cursorY: this.cursorY | 0,
+      },
+    };
+  }
+
+  restoreSnapshot(snapshot) {
+    const bytes = new Uint8Array(this.memory.buffer);
+    const cpu = Buffer.from(snapshot.cpu, "base64");
+    bytes.set(cpu, snapshot.statePointer >>> 0);
+    for (const range of snapshot.memory ?? []) {
+      bytes.set(Buffer.from(range.data, "base64"), range.start >>> 0);
+    }
+    this.virtualTime = snapshot.runtime?.virtualTime >>> 0;
+    this.cursorX = snapshot.runtime?.cursorX | 0;
+    this.cursorY = snapshot.runtime?.cursorY | 0;
+    this.exports?.d2_restore_state?.(snapshot.statePointer >>> 0);
+  }
+
+  invokeFunction({ address, args = [], registers = {}, stackTop = 0x0fff0000,
+                   fuel = 1_000_000, trace = true, memoryTrace = false,
+                   ranges = [] }) {
+    const stateSize = this.exports.d2_state_size() >>> 0;
+    const statePointer = this.alloc(stateSize, 8);
+    const argumentPointer = this.alloc(Math.max(args.length * 4, 4), 4);
+    const registerNames = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "fs_base",
+      "zf", "sf", "cf", "of", "pf", "df"];
+    registerNames.forEach((name, index) => this.exports.d2_set_register(index, registers[name] ?? 0));
+    this.exports.d2_capture_state(statePointer);
+    args.forEach((value, index) => this.view().setUint32(argumentPointer + index * 4, value >>> 0, true));
+    this.exports.d2_set_trace(trace ? 1 : 0, memoryTrace ? 1 : 0);
+    const result = this.exports.d2_invoke_state(
+      address >>> 0, statePointer, stackTop >>> 0, argumentPointer, args.length, fuel,
+    ) >>> 0;
+    const stateView = this.view();
+    const outputRegisters = Object.fromEntries(
+      registerNames.slice(0, 15).map((name, index) => [name, stateView.getUint32(statePointer + index * 4, true)]),
+    );
+    const memory = ranges.map(({ start, size }) => ({
+      start: start >>> 0,
+      size: size >>> 0,
+      data: Buffer.from(new Uint8Array(this.memory.buffer, start >>> 0, size >>> 0)).toString("base64"),
+    }));
+    return {
+      result,
+      status: this.exports.d2_invoke_status() >>> 0,
+      registers: outputRegisters,
+      memory,
+      trace: this.captureTypedTrace(),
+    };
+  }
+
+  setReplacement(entry, kind, value = 0, stackCleanup = 0) {
+    return Boolean(this.exports?.d2_set_override?.(entry >>> 0, kind >>> 0, value >>> 0, stackCleanup >>> 0));
+  }
+
+  clearReplacements() { this.exports?.d2_clear_overrides?.(); }
+
   captureCodePointers(stackPointer, dwordLimit = 2048) {
     const view = this.view();
     const end = Math.min(view.byteLength, stackPointer + dwordLimit * 4);

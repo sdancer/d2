@@ -26,6 +26,7 @@ class PEImage:
     def __init__(self, path: Path):
         self.path = path
         self.data = path.read_bytes()
+        self.content_sha256 = sha256(self.data).hexdigest()
         parsed = lief.PE.parse(str(path))
         if parsed is None:
             raise ValueError(f"not a PE file: {path}")
@@ -35,6 +36,11 @@ class PEImage:
         self.image_base = int(parsed.optional_header.imagebase)
         self.entry_rva = int(parsed.optional_header.addressof_entrypoint)
         self.size_of_image = int(parsed.optional_header.sizeof_image)
+        self.headers_size = min(
+            int(parsed.optional_header.sizeof_headers),
+            len(self.data),
+            self.size_of_image,
+        )
         self.imports = self._read_imports()
         self.highlow_relocation_rvas = {
             int(entry.address)
@@ -64,6 +70,30 @@ class PEImage:
         execute = int(lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE)
         return [s for s in self.binary.sections if int(s.characteristics) & execute]
 
+    def executable_regions(self) -> list[dict[str, int | str]]:
+        regions = []
+        for section in self.executable_sections():
+            start = int(section.virtual_address)
+            if not 0 <= start < self.size_of_image:
+                continue
+            declared_file_size = len(section.content)
+            declared_mapped_size = max(int(section.virtual_size), declared_file_size)
+            mapped_end = min(self.size_of_image, start + declared_mapped_size)
+            file_end = min(mapped_end, start + declared_file_size)
+            if mapped_end <= start:
+                continue
+            regions.append(
+                {
+                    "name": section.name,
+                    "start_rva": start,
+                    "file_end_rva": file_end,
+                    "mapped_end_rva": mapped_end,
+                    "file_size": file_end - start,
+                    "mapped_size": mapped_end - start,
+                }
+            )
+        return sorted(regions, key=lambda region: int(region["start_rva"]))
+
     def is_executable_rva(self, rva: int) -> bool:
         section = self.section_for_rva(rva)
         if section is None:
@@ -71,7 +101,12 @@ class PEImage:
         execute = int(lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE)
         return bool(int(section.characteristics) & execute)
 
+    def is_mapped_rva(self, rva: int) -> bool:
+        return 0 <= rva < self.size_of_image
+
     def bytes_at_rva(self, rva: int, maximum: int) -> bytes:
+        if 0 <= rva < self.headers_size:
+            return self.data[rva : min(self.headers_size, rva + maximum)]
         for section in self.binary.sections:
             start = int(section.virtual_address)
             content = bytes(section.content)
@@ -82,10 +117,15 @@ class PEImage:
         raise ValueError(f"RVA 0x{rva:08x} is not backed by file data in {self.path}")
 
     def section_for_rva(self, rva: int) -> Any | None:
+        if not self.is_mapped_rva(rva):
+            return None
         for section in self.binary.sections:
             start = int(section.virtual_address)
-            size = max(int(section.virtual_size), len(section.content))
-            if start <= rva < start + size:
+            end = min(
+                self.size_of_image,
+                start + max(int(section.virtual_size), len(section.content)),
+            )
+            if start <= rva < end:
                 return section
         return None
 
@@ -121,11 +161,11 @@ class PEImage:
         return {
             "source": self.path.name,
             "runtime_name": runtime_name or self.path.name,
-            "sha256": sha256(self.data).hexdigest(),
+            "sha256": self.content_sha256,
             "file_size": len(self.data),
             "image_base": self.image_base,
             "image_size": self.size_of_image,
-            "headers_size": int(self.binary.optional_header.sizeof_headers),
+            "headers_size": self.headers_size,
             "entry_rva": self.entry_rva,
             "sections": sections,
             "imports": [
@@ -141,6 +181,55 @@ class PEImage:
             "relocations": relocations,
         }
 
+    def _looks_like_pointer_table(self, rva: int) -> bool:
+        # Some tables carry a count/tag word before their first code pointer.
+        for first_index in (0, 1):
+            executable_pointers = 0
+            for index in range(first_index, first_index + 3):
+                try:
+                    target_va = struct.unpack(
+                        "<I", self.bytes_at_rva(rva + index * 4, 4)
+                    )[0]
+                except (ValueError, struct.error):
+                    break
+                if self.is_executable_rva(target_va - self.image_base):
+                    executable_pointers += 1
+                else:
+                    break
+            if executable_pointers >= 2:
+                return True
+        return False
+
+    def relocation_code_pointer_facts(self) -> list[dict[str, int | str]]:
+        """Return HIGHLOW relocation slots that contain possible code pointers."""
+
+        facts = []
+        for rva in sorted(self.highlow_relocation_rvas):
+            try:
+                target_va = struct.unpack("<I", self.bytes_at_rva(rva, 4))[0]
+            except (ValueError, struct.error):
+                continue
+            target_rva = target_va - self.image_base
+            if self.is_executable_rva(target_rva):
+                resolution = (
+                    "ambiguous"
+                    if self._looks_like_pointer_table(target_rva)
+                    else "resolved_executable"
+                )
+            elif self.is_mapped_rva(target_rva):
+                resolution = "non_executable"
+            else:
+                resolution = "unmapped"
+            facts.append(
+                {
+                    "slot_rva": rva,
+                    "target_rva": target_rva,
+                    "target_va": target_va,
+                    "resolution": resolution,
+                }
+            )
+        return facts
+
     def relocation_code_roots(self) -> list[int]:
         """Return executable addresses stored in PE base-relocation slots.
 
@@ -149,18 +238,13 @@ class PEImage:
         source for indirect AOT control flow without guessing from raw words.
         """
 
-        roots = []
-        for block in self.binary.relocations:
-            for entry in block.entries:
-                rva = int(entry.address)
-                try:
-                    target_va = struct.unpack("<I", self.bytes_at_rva(rva, 4))[0]
-                except (ValueError, struct.error):
-                    continue
-                target = target_va - self.image_base
-                if self.is_executable_rva(target):
-                    roots.append(target)
-        return list(dict.fromkeys(roots))
+        return list(
+            dict.fromkeys(
+                int(fact["target_rva"])
+                for fact in self.relocation_code_pointer_facts()
+                if fact["resolution"] == "resolved_executable"
+            )
+        )
 
     def relocate_instruction_value(
         self,

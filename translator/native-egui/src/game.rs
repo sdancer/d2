@@ -153,6 +153,12 @@ pub fn run(
     let stop_trace_limit = environment_u32("D2_STOP_TRACE")?.filter(|limit| *limit != 0);
     let profile_trace = environment_u32("D2_PROFILE_TRACE")?.unwrap_or(0) != 0;
     let profile_round_pcs = environment_u32("D2_PROFILE_ROUND_PCS")?.unwrap_or(0) != 0;
+    let typed_trace = environment_u32("D2_TYPED_TRACE")?.unwrap_or(0) != 0;
+    let memory_trace = environment_u32("D2_MEMORY_TRACE")?.unwrap_or(0) != 0;
+    if typed_trace || memory_trace {
+        let set_trace = wt(instance.get_typed_func::<(u32, u32), ()>(&mut store, "d2_set_trace"))?;
+        wt(set_trace.call(&mut store, (u32::from(typed_trace), u32::from(memory_trace))))?;
+    }
     if environment_u32("D2_DIAGNOSTICS")?.unwrap_or(0) != 0
         || stop_trace_limit.is_some()
         || profile_trace
@@ -906,6 +912,19 @@ fn capture_assertion_trace(caller: &mut Caller<'_, HostState>) -> Result<String,
                     break;
                 }
             }
+        }
+    }
+    let event_count = call_export_u32(caller, "d2_event_count", &[])?.min(256);
+    if event_count > 0 {
+        output.push(String::from("  typed trace events:"));
+        for back in (0..event_count).rev() {
+            let kind = call_export_u32(caller, "d2_event_kind", &[Val::I32(back as i32)])?;
+            let source = call_export_u32(caller, "d2_event_source", &[Val::I32(back as i32)])?;
+            let target = call_export_u32(caller, "d2_event_target", &[Val::I32(back as i32)])?;
+            let aux = call_export_u32(caller, "d2_event_aux", &[Val::I32(back as i32)])?;
+            output.push(format!(
+                "    kind={kind} source={source:#010x} target={target:#010x} aux={aux:#010x}"
+            ));
         }
     }
     Ok(output.join("\n"))
